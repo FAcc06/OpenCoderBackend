@@ -42,7 +42,8 @@ oauth.register(
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "10080"))
-FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:8000')
+# 前端URL - 如果环境变量未设置，则必须由前端传入redirect_uri
+FRONTEND_URL = os.getenv('FRONTEND_URL')
 REDIRECT_URI = os.getenv('GOOGLE_REDIRECT_URI', 'http://localhost:8000/auth/google/callback')
 
 # ==================== 响应模型 ====================
@@ -260,16 +261,23 @@ async def google_callback(request: Request):
         frontend_redirect_uri = request.session.get('frontend_redirect_uri')
         if frontend_redirect_uri:
             logger.info(f"Using frontend redirect URI from session: {frontend_redirect_uri}")
-            redirect_url = f"{frontend_redirect_uri}?token={access_token}"
+            final_callback_url = f"{frontend_redirect_uri}?token={access_token}"
             # 清除 session 中的 redirect_uri
             request.session.pop('frontend_redirect_uri', None)
+        elif FRONTEND_URL:
+            logger.info(f"Using FRONTEND_URL from env: {FRONTEND_URL}")
+            final_callback_url = f"{FRONTEND_URL}/auth/callback?token={access_token}"
         else:
-            logger.info(f"Using default FRONTEND_URL: {FRONTEND_URL}")
-            redirect_url = f"{FRONTEND_URL}/auth/callback?token={access_token}"
+            logger.error("No redirect_uri provided and FRONTEND_URL not set")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="No redirect_uri configured. Please set FRONTEND_URL environment variable or pass redirect_uri parameter."
+            )
         
         logger.info(f"Login successful for user: {email}")
+        print(f"🔗 Final redirect URL: {final_callback_url}")
         
-        return RedirectResponse(url=redirect_url)
+        return RedirectResponse(url=final_callback_url)
         
     except HTTPException:
         raise
@@ -281,9 +289,16 @@ async def google_callback(request: Request):
             error_url = f"{frontend_redirect_uri}?error=auth_failed&message={str(e)}"
             # 清除 session 中的 redirect_uri
             request.session.pop('frontend_redirect_uri', None)
-        else:
+        elif FRONTEND_URL:
             error_url = f"{FRONTEND_URL}/auth/callback?error=auth_failed&message={str(e)}"
+        else:
+            # 如果没有任何重定向URL配置，返回JSON错误
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"OAuth callback error: {str(e)}"
+            )
         # 重定向到错误页面
+        print(f"❌ Error redirect URL: {error_url}")
         return RedirectResponse(url=error_url)
 
 

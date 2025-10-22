@@ -77,7 +77,7 @@ SECRET_KEY=your-secret-key
 ALGORITHM=HS256
 GOOGLE_CLIENT_ID=your-client-id
 GOOGLE_CLIENT_SECRET=your-client-secret
-FRONTEND_URL=http://localhost:5173
+FRONTEND_URL=http://localhost:
 ENCRYPTION_KEY=your-encryption-key
 ```
 
