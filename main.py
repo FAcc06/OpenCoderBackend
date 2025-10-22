@@ -37,12 +37,12 @@ app.add_middleware(
 
 # CORS中间件
 # 获取前端 URL（支持多个，用逗号分隔）
-frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
+frontend_url = os.getenv("FRONTEND_URL")
 allowed_origins = [
-    "http://localhost:5173",  # 前端开发服务器
-    "http://127.0.0.1:5173",  # 前端开发服务器（备用）
-    "http://localhost:3000",  # React默认端口（备用）
-    "http://localhost:8000",  # 本地后端
+    # "http://localhost:5173",  # 前端开发服务器
+    # "http://127.0.0.1:5173",  # 前端开发服务器（备用）
+    # "http://localhost:3000",  # React默认端口（备用）
+    # "http://localhost:8000",  # 本地后端
     "https://opencoderfrontend.onrender.com",  # ⭐ 生产环境前端
 ]
 
