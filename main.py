@@ -29,25 +29,35 @@ app = FastAPI(
 )
 
 # Session中间件（OAuth需要）
+# 注意：必须在CORS中间件之前添加
 app.add_middleware(
     SessionMiddleware,
     secret_key=os.getenv("SECRET_KEY", "your-secret-key-change-in-production"),
-    max_age=604800  # 7天
+    max_age=604800,  # 7天
+    same_site="lax",  # 允许跨站请求携带cookie
+    https_only=False  # 本地开发时设为False，生产环境建议True
 )
 
 # CORS中间件
-# 获取前端 URL（支持多个，用逗号分隔）
-frontend_url = os.getenv("FRONTEND_URL")
-allowed_origins = [
-    # "http://localhost:5173",  # 前端开发服务器
-    # "http://127.0.0.1:5173",  # 前端开发服务器（备用）
-    # "http://localhost:3000",  # React默认端口（备用）
-    # "http://localhost:8000",  # 本地后端
-    "https://opencoderfrontend.onrender.com",  # ⭐ 生产环境前端
-]
+# 根据环境自动选择允许的源
+IS_PRODUCTION = os.getenv("RENDER") is not None  # Render会自动设置RENDER环境变量
 
-# 添加生产环境前端 URL（如果通过环境变量提供了额外的URL）
-if frontend_url not in allowed_origins:
+if IS_PRODUCTION:
+    # 生产环境：仅允许生产前端
+    allowed_origins = [
+        "https://opencoderfrontend.onrender.com",
+    ]
+else:
+    # 开发环境：允许 localhost
+    allowed_origins = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:8000",
+    ]
+
+# 如果环境变量提供了额外的URL，添加进去
+frontend_url = os.getenv("FRONTEND_URL")
+if frontend_url and frontend_url not in allowed_origins:
     allowed_origins.append(frontend_url)
 
 app.add_middleware(
@@ -57,6 +67,11 @@ app.add_middleware(
     allow_methods=["*"],  # 允许所有HTTP方法
     allow_headers=["*"],
 )
+
+# 启动时打印CORS配置
+print(f"🔒 CORS Configuration:")
+print(f"   Environment: {'Production (Render)' if IS_PRODUCTION else 'Development (Local)'}")
+print(f"   Allowed origins: {allowed_origins}")
 
 # 静态文件服务
 app.mount("/static", StaticFiles(directory="static"), name="static")
