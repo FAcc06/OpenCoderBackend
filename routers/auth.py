@@ -174,11 +174,14 @@ def verify_token(token: str) -> dict:
 # ==================== API 端点 ====================
 
 @router.get('/login', tags=["authentication"])
-async def google_login(request: Request):
+async def google_login(request: Request, redirect_uri: Optional[str] = None):
     """
     发起 Google OAuth 登录
     
     重定向用户到 Google 登录页面进行授权
+    
+    **参数：**
+    - redirect_uri: 前端回调地址（可选），例如 https://opencoderfrontend.onrender.com/auth/callback
     
     **流程：**
     1. 用户访问此端点
@@ -186,6 +189,12 @@ async def google_login(request: Request):
     3. 用户授权后返回到 /auth/google/callback
     """
     logger.info("Initiating Google OAuth login")
+    
+    # 将前端传入的 redirect_uri 存储到 session 中
+    if redirect_uri:
+        request.session['frontend_redirect_uri'] = redirect_uri
+        logger.info(f"Stored frontend redirect URI in session: {redirect_uri}")
+    
     return await oauth.google.authorize_redirect(request, REDIRECT_URI)
 
 
@@ -247,8 +256,17 @@ async def google_callback(request: Request):
             }
         )
         
-        # 重定向回前端，附带 token
-        redirect_url = f"{FRONTEND_URL}/auth/callback?token={access_token}"
+        # 从 session 中获取前端传入的 redirect_uri，如果没有则使用环境变量
+        frontend_redirect_uri = request.session.get('frontend_redirect_uri')
+        if frontend_redirect_uri:
+            logger.info(f"Using frontend redirect URI from session: {frontend_redirect_uri}")
+            redirect_url = f"{frontend_redirect_uri}?token={access_token}"
+            # 清除 session 中的 redirect_uri
+            request.session.pop('frontend_redirect_uri', None)
+        else:
+            logger.info(f"Using default FRONTEND_URL: {FRONTEND_URL}")
+            redirect_url = f"{FRONTEND_URL}/auth/callback?token={access_token}"
+        
         logger.info(f"Login successful for user: {email}")
         
         return RedirectResponse(url=redirect_url)
@@ -257,10 +275,16 @@ async def google_callback(request: Request):
         raise
     except Exception as e:
         logger.error(f"OAuth callback error: {e}", exc_info=True)
+        # 从 session 中获取前端传入的 redirect_uri
+        frontend_redirect_uri = request.session.get('frontend_redirect_uri')
+        if frontend_redirect_uri:
+            error_url = f"{frontend_redirect_uri}?error=auth_failed&message={str(e)}"
+            # 清除 session 中的 redirect_uri
+            request.session.pop('frontend_redirect_uri', None)
+        else:
+            error_url = f"{FRONTEND_URL}/auth/callback?error=auth_failed&message={str(e)}"
         # 重定向到错误页面
-        return RedirectResponse(
-            url=f"{FRONTEND_URL}/auth/callback?error=auth_failed&message={str(e)}"
-        )
+        return RedirectResponse(url=error_url)
 
 
 @router.get('/user', response_model=UserResponse, tags=["authentication"])
