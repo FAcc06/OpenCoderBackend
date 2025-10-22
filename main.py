@@ -43,9 +43,10 @@ allowed_origins = [
     "http://127.0.0.1:5173",  # 前端开发服务器（备用）
     "http://localhost:3000",  # React默认端口（备用）
     "http://localhost:8000",  # 本地后端
+    "https://opencoderfrontend.onrender.com",  # ⭐ 生产环境前端
 ]
 
-# 添加生产环境前端 URL
+# 添加生产环境前端 URL（如果通过环境变量提供了额外的URL）
 if frontend_url not in allowed_origins:
     allowed_origins.append(frontend_url)
 
@@ -53,7 +54,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_methods=["*"],  # 允许所有HTTP方法
     allow_headers=["*"],
 )
 
