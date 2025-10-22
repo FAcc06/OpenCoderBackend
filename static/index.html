@@ -1,0 +1,1295 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MongoDB 标注平台</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <style>
+        .sidebar {
+            min-height: 100vh;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        .main-content {
+            background-color: #f8f9fa;
+            min-height: 100vh;
+        }
+        .card {
+            border: none;
+            box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075);
+            border-radius: 0.5rem;
+        }
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border: none;
+        }
+        .btn-primary:hover {
+            background: linear-gradient(135deg, #5a6fd8 0%, #6a4190 100%);
+        }
+        .nav-link {
+            color: rgba(255, 255, 255, 0.8);
+            transition: all 0.3s;
+        }
+        .nav-link:hover, .nav-link.active {
+            color: white;
+            background-color: rgba(255, 255, 255, 0.1);
+            border-radius: 0.375rem;
+        }
+        .status-badge {
+            font-size: 0.75rem;
+            padding: 0.25rem 0.5rem;
+        }
+        .task-card {
+            transition: transform 0.2s;
+        }
+        .task-card:hover {
+            transform: translateY(-2px);
+        }
+        .annotation-form {
+            background: white;
+            border-radius: 0.5rem;
+            padding: 1.5rem;
+            margin-top: 1rem;
+        }
+        .tag-option {
+            margin: 0.25rem;
+        }
+        .loading {
+            display: none;
+        }
+        .loading.show {
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <div class="container-fluid">
+        <div class="row">
+            <!-- 侧边栏 -->
+            <div class="col-md-3 col-lg-2 sidebar p-0">
+                <div class="p-3">
+                    <h4 class="text-white mb-4">
+                        <i class="fas fa-database me-2"></i>
+                        MongoDB 标注平台
+                    </h4>
+                    
+                    <!-- 用户信息 -->
+                    <div class="mb-4 p-3 bg-white bg-opacity-10 rounded" id="user-info-sidebar">
+                        <div id="logged-in-user" style="display: none;">
+                            <div class="d-flex align-items-center mb-2">
+                                <img id="user-avatar" src="" alt="Avatar" class="rounded-circle me-2" style="width: 40px; height: 40px;">
+                                <div class="text-white">
+                                    <div id="user-name-display" style="font-size: 0.9rem; font-weight: bold;"></div>
+                                    <div id="user-email-display" style="font-size: 0.75rem; opacity: 0.8;"></div>
+                                </div>
+                            </div>
+                            <button class="btn btn-sm btn-outline-light w-100" onclick="logout()">
+                                <i class="fas fa-sign-out-alt me-1"></i> 退出登录
+                            </button>
+                        </div>
+                        <div id="not-logged-in" style="display: block;">
+                            <p class="text-white mb-2" style="font-size: 0.9rem;">请先登录</p>
+                            <button class="btn btn-light w-100" onclick="googleLogin()">
+                                <i class="fab fa-google me-2"></i> Google 登录
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <nav class="nav flex-column">
+                        <a class="nav-link active" href="#" onclick="showSection('dashboard')">
+                            <i class="fas fa-tachometer-alt me-2"></i> 仪表板
+                        </a>
+                        <a class="nav-link" href="#" onclick="showSection('projects')">
+                            <i class="fas fa-project-diagram me-2"></i> 项目管理
+                        </a>
+                        <a class="nav-link" href="#" onclick="showSection('tasks')">
+                            <i class="fas fa-tasks me-2"></i> 任务管理
+                        </a>
+                        <a class="nav-link" href="#" onclick="showSection('annotations')">
+                            <i class="fas fa-tags me-2"></i> 标注管理
+                        </a>
+                        <a class="nav-link" href="#" onclick="showSection('board')">
+                            <i class="fas fa-columns me-2"></i> 看板视图
+                        </a>
+                        <a class="nav-link" href="#" onclick="showSection('settings')">
+                            <i class="fas fa-cog me-2"></i> 设置
+                        </a>
+                    </nav>
+                </div>
+            </div>
+
+            <!-- 主内容区 -->
+            <div class="col-md-9 col-lg-10 main-content">
+                <div class="p-4">
+                    <!-- 仪表板 -->
+                    <div id="dashboard" class="content-section">
+                        <div class="d-flex justify-content-between align-items-center mb-4">
+                            <h2>仪表板</h2>
+                            <div class="loading" id="loading">
+                                <div class="spinner-border text-primary" role="status">
+                                    <span class="visually-hidden">加载中...</span>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div class="row mb-4">
+                            <div class="col-md-3">
+                                <div class="card text-center">
+                                    <div class="card-body">
+                                        <i class="fas fa-project-diagram fa-2x text-primary mb-2"></i>
+                                        <h5 class="card-title">项目总数</h5>
+                                        <h3 class="text-primary" id="total-projects">0</h3>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-3">
+                                <div class="card text-center">
+                                    <div class="card-body">
+                                        <i class="fas fa-tasks fa-2x text-success mb-2"></i>
+                                        <h5 class="card-title">任务总数</h5>
+                                        <h3 class="text-success" id="total-tasks">0</h3>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-3">
+                                <div class="card text-center">
+                                    <div class="card-body">
+                                        <i class="fas fa-tags fa-2x text-warning mb-2"></i>
+                                        <h5 class="card-title">标注总数</h5>
+                                        <h3 class="text-warning" id="total-annotations">0</h3>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-3">
+                                <div class="card text-center">
+                                    <div class="card-body">
+                                        <i class="fas fa-users fa-2x text-info mb-2"></i>
+                                        <h5 class="card-title">成员总数</h5>
+                                        <h3 class="text-info" id="total-members">0</h3>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="row">
+                            <div class="col-md-6">
+                                <div class="card">
+                                    <div class="card-header">
+                                        <h5>最近项目</h5>
+                                    </div>
+                                    <div class="card-body">
+                                        <div id="recent-projects">
+                                            <p class="text-muted">暂无项目数据</p>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-6">
+                                <div class="card">
+                                    <div class="card-header">
+                                        <h5 class="mb-0">Status Distribution</h5>
+                                        <small class="text-muted">Task status breakdown</small>
+                                    </div>
+                                    <div class="card-body">
+                                        <div class="row">
+                                            <!-- 环形图 -->
+                                            <div class="col-md-6 d-flex align-items-center justify-content-center">
+                                                <div style="position: relative; height: 200px; width: 200px;">
+                                                    <canvas id="statusDistributionChart"></canvas>
+                                                </div>
+                                            </div>
+                                            <!-- 图例 -->
+                                            <div class="col-md-6 d-flex align-items-center">
+                                                <div id="status-legend" class="w-100">
+                                                    <div class="d-flex align-items-center mb-2">
+                                                        <span style="display: inline-block; width: 12px; height: 12px; background-color: #10b981; border-radius: 2px; margin-right: 8px;"></span>
+                                                        <span class="text-muted small">Done</span>
+                                                        <span class="ms-auto fw-bold" id="legend-done">--</span>
+                                                    </div>
+                                                    <div class="d-flex align-items-center mb-2">
+                                                        <span style="display: inline-block; width: 12px; height: 12px; background-color: #3b82f6; border-radius: 2px; margin-right: 8px;"></span>
+                                                        <span class="text-muted small">In Progress</span>
+                                                        <span class="ms-auto fw-bold" id="legend-in-progress">--</span>
+                                                    </div>
+                                                    <div class="d-flex align-items-center mb-2">
+                                                        <span style="display: inline-block; width: 12px; height: 12px; background-color: #f59e0b; border-radius: 2px; margin-right: 8px;"></span>
+                                                        <span class="text-muted small">Assigned</span>
+                                                        <span class="ms-auto fw-bold" id="legend-assigned">--</span>
+                                                    </div>
+                                                    <div class="d-flex align-items-center">
+                                                        <span style="display: inline-block; width: 12px; height: 12px; background-color: #6b7280; border-radius: 2px; margin-right: 8px;"></span>
+                                                        <span class="text-muted small">Open</span>
+                                                        <span class="ms-auto fw-bold" id="legend-open">--</span>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 项目管理 -->
+                    <div id="projects" class="content-section" style="display: none;">
+                        <div class="d-flex justify-content-between align-items-center mb-4">
+                            <h2>项目管理</h2>
+                            <button class="btn btn-primary" onclick="showCreateProjectModal()">
+                                <i class="fas fa-plus me-2"></i> 创建项目
+                            </button>
+                        </div>
+                        
+                        <div class="card">
+                            <div class="card-body">
+                                <div class="table-responsive">
+                                    <table class="table table-hover">
+                                        <thead>
+                                            <tr>
+                                                <th>项目名称</th>
+                                                <th>Slug</th>
+                                                <th>状态</th>
+                                                <th>标签</th>
+                                                <th>创建时间</th>
+                                                <th>操作</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="projects-table">
+                                            <tr>
+                                                <td colspan="6" class="text-center text-muted">加载中...</td>
+                                            </tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 任务管理 -->
+                    <div id="tasks" class="content-section" style="display: none;">
+                        <div class="d-flex justify-content-between align-items-center mb-4">
+                            <h2>任务管理</h2>
+                            <div>
+                                <select class="form-select d-inline-block w-auto me-2" id="project-select">
+                                    <option value="">选择项目</option>
+                                </select>
+                                <button class="btn btn-primary" onclick="showCreateTaskModal()">
+                                    <i class="fas fa-plus me-2"></i> 创建任务
+                                </button>
+                            </div>
+                        </div>
+                        
+                        <div class="card">
+                            <div class="card-body">
+                                <div class="table-responsive">
+                                    <table class="table table-hover">
+                                        <thead>
+                                            <tr>
+                                                <th>任务标题</th>
+                                                <th>状态</th>
+                                                <th>标签</th>
+                                                <th>创建者</th>
+                                                <th>创建时间</th>
+                                                <th>操作</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="tasks-table">
+                                            <tr>
+                                                <td colspan="6" class="text-center text-muted">请先选择项目</td>
+                                            </tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 标注管理 -->
+                    <div id="annotations" class="content-section" style="display: none;">
+                        <div class="d-flex justify-content-between align-items-center mb-4">
+                            <h2>标注管理</h2>
+                            <div>
+                                <select class="form-select d-inline-block w-auto me-2" id="annotation-project-select">
+                                    <option value="">选择项目</option>
+                                </select>
+                                <button class="btn btn-primary" onclick="showAnnotationModal()">
+                                    <i class="fas fa-plus me-2"></i> 创建标注
+                                </button>
+                            </div>
+                        </div>
+                        
+                        <div class="card">
+                            <div class="card-body">
+                                <div class="table-responsive">
+                                    <table class="table table-hover">
+                                        <thead>
+                                            <tr>
+                                                <th>任务标题</th>
+                                                <th>标注者</th>
+                                                <th>标签</th>
+                                                <th>完成时间</th>
+                                                <th>操作</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="annotations-table">
+                                            <tr>
+                                                <td colspan="5" class="text-center text-muted">请先选择项目</td>
+                                            </tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 看板视图 -->
+                    <div id="board" class="content-section" style="display: none;">
+                        <div class="d-flex justify-content-between align-items-center mb-4">
+                            <h2>看板视图</h2>
+                            <select class="form-select d-inline-block w-auto" id="board-project-select">
+                                <option value="">选择项目</option>
+                            </select>
+                        </div>
+                        
+                        <div id="board-content">
+                            <div class="text-center text-muted">
+                                <i class="fas fa-columns fa-3x mb-3"></i>
+                                <p>请先选择项目查看看板</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 设置 -->
+                    <div id="settings" class="content-section" style="display: none;">
+                        <h2>设置</h2>
+                        <div class="row">
+                            <div class="col-md-6">
+                                <div class="card">
+                                    <div class="card-header">
+                                        <h5>用户信息</h5>
+                                    </div>
+                                    <div class="card-body">
+                                        <form id="user-settings-form">
+                                            <div class="mb-3">
+                                                <label class="form-label">姓名</label>
+                                                <input type="text" class="form-control" id="user-name" value="示例用户">
+                                            </div>
+                                            <div class="mb-3">
+                                                <label class="form-label">邮箱</label>
+                                                <input type="email" class="form-control" id="user-email" value="user@example.com">
+                                            </div>
+                                            <div class="mb-3">
+                                                <label class="form-label">角色</label>
+                                                <select class="form-select" id="user-role">
+                                                    <option value="manager">管理员</option>
+                                                    <option value="coder">编码员</option>
+                                                </select>
+                                            </div>
+                                            <button type="submit" class="btn btn-primary">保存设置</button>
+                                        </form>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-6">
+                                <div class="card">
+                                    <div class="card-header">
+                                        <h5>API 测试</h5>
+                                    </div>
+                                    <div class="card-body">
+                                        <div class="mb-3">
+                                            <label class="form-label">API 端点</label>
+                                            <input type="text" class="form-control" id="api-endpoint" value="http://localhost:8000">
+                                        </div>
+                                        <div class="mb-3">
+                                            <label class="form-label">测试数据</label>
+                                            <textarea class="form-control" id="test-data" rows="5" placeholder="输入测试数据..."></textarea>
+                                        </div>
+                                        <button class="btn btn-success" onclick="testAPI()">测试 API</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 创建项目模态框 -->
+    <div class="modal fade" id="createProjectModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">创建项目</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <form id="create-project-form">
+                        <div class="mb-3">
+                            <label class="form-label">项目名称</label>
+                            <input type="text" class="form-control" id="project-name" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Slug</label>
+                            <input type="text" class="form-control" id="project-slug" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">标签 (用逗号分隔)</label>
+                            <input type="text" class="form-control" id="project-tags" placeholder="nlp,annotation,ai">
+                        </div>
+                    </form>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+                    <button type="button" class="btn btn-primary" onclick="createProject()">创建</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 创建任务模态框 -->
+    <div class="modal fade" id="createTaskModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">创建任务</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <form id="create-task-form">
+                        <div class="mb-3">
+                            <label class="form-label">任务标题</label>
+                            <input type="text" class="form-control" id="task-title" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">任务内容</label>
+                            <textarea class="form-control" id="task-content" rows="4" required></textarea>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">标签 (用逗号分隔)</label>
+                            <input type="text" class="form-control" id="task-tags" placeholder="sentiment,classification">
+                        </div>
+                    </form>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+                    <button type="button" class="btn btn-primary" onclick="createTask()">创建</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 标注模态框 -->
+    <div class="modal fade" id="annotationModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">创建标注</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <form id="annotation-form">
+                        <div class="mb-3">
+                            <label class="form-label">选择任务</label>
+                            <select class="form-select" id="annotation-task-select" required>
+                                <option value="">请选择任务</option>
+                            </select>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">情感标注</label>
+                            <div class="form-check">
+                                <input class="form-check-input" type="radio" name="sentiment" id="sentiment-positive" value="s_pos">
+                                <label class="form-check-label" for="sentiment-positive">积极</label>
+                            </div>
+                            <div class="form-check">
+                                <input class="form-check-input" type="radio" name="sentiment" id="sentiment-negative" value="s_neg">
+                                <label class="form-check-label" for="sentiment-negative">消极</label>
+                            </div>
+                            <div class="form-check">
+                                <input class="form-check-input" type="radio" name="sentiment" id="sentiment-neutral" value="s_neu">
+                                <label class="form-check-label" for="sentiment-neutral">中性</label>
+                            </div>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">角色标注</label>
+                            <div class="form-check">
+                                <input class="form-check-input" type="checkbox" name="role" id="role-coder" value="r_coder">
+                                <label class="form-check-label" for="role-coder">编码员</label>
+                            </div>
+                            <div class="form-check">
+                                <input class="form-check-input" type="checkbox" name="role" id="role-reviewer" value="r_reviewer">
+                                <label class="form-check-label" for="role-reviewer">审查员</label>
+                            </div>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">备注</label>
+                            <textarea class="form-control" id="annotation-notes" rows="3"></textarea>
+                        </div>
+                    </form>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+                    <button type="button" class="btn btn-primary" onclick="createAnnotation()">提交标注</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        // 全局变量
+        let currentUser = null;
+        let authToken = null;
+        
+        let projects = [];
+        let tasks = [];
+        let annotations = [];
+        
+        // ============ 认证相关函数 ============
+        
+        // 页面加载时检查登录状态
+        async function checkLoginStatus() {
+            // 首先检查 URL 参数中是否有 token（OAuth 回调）
+            const urlParams = new URLSearchParams(window.location.search);
+            const tokenFromUrl = urlParams.get('token');
+            const errorFromUrl = urlParams.get('error');
+            
+            if (errorFromUrl) {
+                alert('登录失败: ' + errorFromUrl);
+                window.history.replaceState({}, document.title, window.location.pathname);
+                return;
+            }
+            
+            if (tokenFromUrl) {
+                // 保存 token 到 localStorage
+                localStorage.setItem('authToken', tokenFromUrl);
+                authToken = tokenFromUrl;
+                // 清除 URL 参数
+                window.history.replaceState({}, document.title, window.location.pathname);
+            } else {
+                // 从 localStorage 读取 token
+                authToken = localStorage.getItem('authToken');
+            }
+            
+            if (authToken) {
+                // 验证 token 并获取用户信息
+                try {
+                    const response = await fetch(`http://localhost:8000/auth/user?token=${authToken}`);
+                    if (response.ok) {
+                        currentUser = await response.json();
+                        updateUserUI();
+                        console.log('用户已登录:', currentUser);
+                    } else {
+                        // token 无效，清除
+                        localStorage.removeItem('authToken');
+                        authToken = null;
+                        updateUserUI();
+                    }
+                } catch (error) {
+                    console.error('验证 token 失败:', error);
+                    localStorage.removeItem('authToken');
+                    authToken = null;
+                    updateUserUI();
+                }
+            } else {
+                updateUserUI();
+            }
+        }
+        
+        // 更新用户界面
+        function updateUserUI() {
+            const loggedInDiv = document.getElementById('logged-in-user');
+            const notLoggedInDiv = document.getElementById('not-logged-in');
+            
+            if (currentUser) {
+                // 显示已登录状态
+                document.getElementById('user-avatar').src = currentUser.avatar_url || 'https://via.placeholder.com/40';
+                document.getElementById('user-name-display').textContent = currentUser.name || 'Anonymous';
+                document.getElementById('user-email-display').textContent = currentUser.email || '';
+                
+                loggedInDiv.style.display = 'block';
+                notLoggedInDiv.style.display = 'none';
+                
+                // 更新设置页面的用户信息
+                document.getElementById('user-name').value = currentUser.name || '';
+                document.getElementById('user-email').value = currentUser.email || '';
+                if (currentUser.role) {
+                    document.getElementById('user-role').value = currentUser.role;
+                }
+            } else {
+                // 显示未登录状态
+                loggedInDiv.style.display = 'none';
+                notLoggedInDiv.style.display = 'block';
+            }
+        }
+        
+        // Google 登录
+        function googleLogin() {
+            window.location.href = 'http://localhost:8000/auth/login';
+        }
+        
+        // 登出
+        function logout() {
+            if (confirm('确定要退出登录吗？')) {
+                localStorage.removeItem('authToken');
+                authToken = null;
+                currentUser = null;
+                updateUserUI();
+                alert('已退出登录');
+            }
+        }
+        
+        // ============ 原有代码 ============
+
+        // 示例数据
+        const sampleData = {
+            projects: [
+                {
+                    id: "507f1f77bcf86cd799439011",
+                    name: "情感分析项目",
+                    slug: "sentiment-analysis",
+                    status: "active",
+                    tags: ["nlp", "sentiment"],
+                    created_at: "2024-01-15T10:30:00Z"
+                },
+                {
+                    id: "507f1f77bcf86cd799439012",
+                    name: "文本分类项目",
+                    slug: "text-classification",
+                    status: "active",
+                    tags: ["nlp", "classification"],
+                    created_at: "2024-01-20T14:15:00Z"
+                }
+            ],
+            tasks: [
+                {
+                    id: "507f1f77bcf86cd799439021",
+                    title: "标注产品评论情感",
+                    content: "请标注以下产品评论的情感倾向：这个产品真的很棒，质量很好，推荐购买！",
+                    status: "open",
+                    tags: ["sentiment"],
+                    created_at: "2024-01-15T11:00:00Z"
+                },
+                {
+                    id: "507f1f77bcf86cd799439022",
+                    title: "标注新闻文章分类",
+                    content: "请将以下新闻文章分类：科技、体育、政治、娱乐等",
+                    status: "assigned",
+                    tags: ["classification"],
+                    created_at: "2024-01-16T09:30:00Z"
+                }
+            ],
+            annotations: [
+                {
+                    id: "507f1f77bcf86cd799439031",
+                    task_id: "507f1f77bcf86cd799439021",
+                    labels: [
+                        { group_id: "g_sentiment", option_ids: ["s_pos"] },
+                        { group_id: "g_role", option_ids: ["r_coder"] }
+                    ],
+                    notes: "评论表达了对产品的积极态度",
+                    completed_at: "2024-01-15T12:00:00Z"
+                }
+            ]
+        };
+
+        // 页面加载完成后初始化
+        document.addEventListener('DOMContentLoaded', async function() {
+            await checkLoginStatus();  // 先检查登录状态
+            loadSampleData();
+            await updateDashboard();
+            loadProjects();
+        });
+
+        // 加载示例数据
+        function loadSampleData() {
+            projects = sampleData.projects;
+            tasks = sampleData.tasks;
+            annotations = sampleData.annotations;
+        }
+
+        // 显示指定部分
+        function showSection(sectionName) {
+            // 隐藏所有内容部分
+            document.querySelectorAll('.content-section').forEach(section => {
+                section.style.display = 'none';
+            });
+            
+            // 移除所有导航链接的active类
+            document.querySelectorAll('.nav-link').forEach(link => {
+                link.classList.remove('active');
+            });
+            
+            // 显示选中的部分
+            document.getElementById(sectionName).style.display = 'block';
+            
+            // 添加active类到对应的导航链接
+            event.target.classList.add('active');
+            
+            // 根据部分加载相应数据
+            switch(sectionName) {
+                case 'dashboard':
+                    updateDashboard();
+                    break;
+                case 'projects':
+                    loadProjects();
+                    break;
+                case 'tasks':
+                    loadTasks();
+                    break;
+                case 'annotations':
+                    loadAnnotations();
+                    break;
+                case 'board':
+                    loadBoard();
+                    break;
+            }
+        }
+
+        // 全局变量存储图表实例
+        let statusDistributionChartInstance = null;
+        
+        // 更新仪表板
+        async function updateDashboard() {
+            document.getElementById('total-projects').textContent = projects.length;
+            document.getElementById('total-tasks').textContent = tasks.length;
+            document.getElementById('total-annotations').textContent = annotations.length;
+            document.getElementById('total-members').textContent = 5; // 示例数据
+            
+            // 显示最近项目
+            const recentProjectsHtml = projects.slice(0, 3).map(project => `
+                <div class="d-flex justify-content-between align-items-center mb-2">
+                    <span>${project.name}</span>
+                    <span class="badge bg-${project.status === 'active' ? 'success' : 'secondary'}">${project.status}</span>
+                </div>
+            `).join('');
+            document.getElementById('recent-projects').innerHTML = recentProjectsHtml || '<p class="text-muted">暂无项目数据</p>';
+            
+            // 加载任务状态分布图表
+            await loadStatusDistribution();
+        }
+        
+        // 加载任务状态分布
+        async function loadStatusDistribution() {
+            // 检查用户是否有项目
+            if (!currentUser || !currentUser.project_id) {
+                // 显示示例数据
+                drawStatusDistributionChart({
+                    done: 47,
+                    in_progress: 11,
+                    assigned: 19,
+                    open: 23
+                });
+                return;
+            }
+            
+            const projectId = currentUser.project_id;
+            
+            try {
+                const response = await fetch(`http://localhost:8000/api/board/${projectId}/board/stats`);
+                
+                if (!response.ok) {
+                    throw new Error('Failed to fetch task statistics');
+                }
+                
+                const data = await response.json();
+                
+                drawStatusDistributionChart({
+                    done: data.task_stats.done || 0,
+                    in_progress: data.task_stats.in_progress || 0,
+                    assigned: data.task_stats.assigned || 0,
+                    open: data.task_stats.open || 0
+                });
+            } catch (error) {
+                console.error('加载任务状态分布失败:', error);
+                // 显示示例数据
+                drawStatusDistributionChart({
+                    done: 47,
+                    in_progress: 11,
+                    assigned: 19,
+                    open: 23
+                });
+            }
+        }
+        
+        // 绘制状态分布环形图
+        function drawStatusDistributionChart(taskStats) {
+            const ctx = document.getElementById('statusDistributionChart');
+            
+            if (!ctx) return;
+            
+            // 计算总数和百分比
+            const total = taskStats.done + taskStats.in_progress + taskStats.assigned + taskStats.open;
+            
+            if (total === 0) {
+                // 没有数据时显示提示
+                ctx.parentElement.innerHTML = '<p class="text-muted text-center">暂无任务数据</p>';
+                return;
+            }
+            
+            const donePercent = ((taskStats.done / total) * 100).toFixed(0);
+            const inProgressPercent = ((taskStats.in_progress / total) * 100).toFixed(0);
+            const assignedPercent = ((taskStats.assigned / total) * 100).toFixed(0);
+            const openPercent = ((taskStats.open / total) * 100).toFixed(0);
+            
+            // 更新图例
+            document.getElementById('legend-done').textContent = `${donePercent}%`;
+            document.getElementById('legend-in-progress').textContent = `${inProgressPercent}%`;
+            document.getElementById('legend-assigned').textContent = `${assignedPercent}%`;
+            document.getElementById('legend-open').textContent = `${openPercent}%`;
+            
+            // 销毁旧图表实例
+            if (statusDistributionChartInstance) {
+                statusDistributionChartInstance.destroy();
+            }
+            
+            // 创建新图表
+            statusDistributionChartInstance = new Chart(ctx, {
+                type: 'doughnut',
+                data: {
+                    labels: ['Done', 'In Progress', 'Assigned', 'Open'],
+                    datasets: [{
+                        data: [
+                            taskStats.done,
+                            taskStats.in_progress,
+                            taskStats.assigned,
+                            taskStats.open
+                        ],
+                        backgroundColor: [
+                            'rgba(16, 185, 129, 0.8)',   // 绿色 - Done
+                            'rgba(59, 130, 246, 0.8)',   // 蓝色 - In Progress
+                            'rgba(245, 158, 11, 0.8)',   // 橙色 - Assigned
+                            'rgba(107, 114, 128, 0.7)'   // 灰色 - Open
+                        ],
+                        borderColor: [
+                            'rgb(16, 185, 129)',
+                            'rgb(59, 130, 246)',
+                            'rgb(245, 158, 11)',
+                            'rgb(107, 114, 128)'
+                        ],
+                        borderWidth: 2
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    plugins: {
+                        legend: {
+                            display: false  // 使用自定义图例
+                        },
+                        tooltip: {
+                            callbacks: {
+                                label: function(context) {
+                                    const label = context.label || '';
+                                    const value = context.parsed;
+                                    const total = context.dataset.data.reduce((a, b) => a + b, 0);
+                                    const percentage = total > 0 ? ((value / total) * 100).toFixed(1) : 0;
+                                    return `${label}: ${value} (${percentage}%)`;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // 获取状态标签
+        function getStatusLabel(status) {
+            const labels = {
+                'open': '开放',
+                'assigned': '已分配',
+                'in_progress': '进行中',
+                'done': '已完成'
+            };
+            return labels[status] || status;
+        }
+
+        // 加载项目列表
+        function loadProjects() {
+            const tbody = document.getElementById('projects-table');
+            if (projects.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted">暂无项目数据</td></tr>';
+                return;
+            }
+            
+            const rows = projects.map(project => `
+                <tr>
+                    <td>${project.name}</td>
+                    <td><code>${project.slug}</code></td>
+                    <td><span class="badge bg-${project.status === 'active' ? 'success' : 'secondary'}">${project.status}</span></td>
+                    <td>${project.tags.map(tag => `<span class="badge bg-light text-dark me-1">${tag}</span>`).join('')}</td>
+                    <td>${new Date(project.created_at).toLocaleDateString()}</td>
+                    <td>
+                        <button class="btn btn-sm btn-outline-primary me-1" onclick="viewProject('${project.id}')">查看</button>
+                        <button class="btn btn-sm btn-outline-danger" onclick="deleteProject('${project.id}')">删除</button>
+                    </td>
+                </tr>
+            `).join('');
+            
+            tbody.innerHTML = rows;
+        }
+
+        // 加载任务列表
+        function loadTasks() {
+            const tbody = document.getElementById('tasks-table');
+            if (tasks.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted">暂无任务数据</td></tr>';
+                return;
+            }
+            
+            const rows = tasks.map(task => `
+                <tr>
+                    <td>${task.title}</td>
+                    <td><span class="badge bg-${getStatusColor(task.status)}">${getStatusLabel(task.status)}</span></td>
+                    <td>${task.tags.map(tag => `<span class="badge bg-light text-dark me-1">${tag}</span>`).join('')}</td>
+                    <td>${currentUser.name}</td>
+                    <td>${new Date(task.created_at).toLocaleDateString()}</td>
+                    <td>
+                        <button class="btn btn-sm btn-outline-primary me-1" onclick="viewTask('${task.id}')">查看</button>
+                        <button class="btn btn-sm btn-outline-warning me-1" onclick="editTask('${task.id}')">编辑</button>
+                        <button class="btn btn-sm btn-outline-danger" onclick="deleteTask('${task.id}')">删除</button>
+                    </td>
+                </tr>
+            `).join('');
+            
+            tbody.innerHTML = rows;
+        }
+
+        // 获取状态颜色
+        function getStatusColor(status) {
+            const colors = {
+                'open': 'secondary',
+                'assigned': 'info',
+                'in_progress': 'warning',
+                'done': 'success'
+            };
+            return colors[status] || 'secondary';
+        }
+
+        // 加载标注列表
+        function loadAnnotations() {
+            const tbody = document.getElementById('annotations-table');
+            if (annotations.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted">暂无标注数据</td></tr>';
+                return;
+            }
+            
+            const rows = annotations.map(annotation => {
+                const task = tasks.find(t => t.id === annotation.task_id);
+                const labels = annotation.labels.map(label => 
+                    `${label.group_id}: ${label.option_ids.join(', ')}`
+                ).join('; ');
+                
+                return `
+                    <tr>
+                        <td>${task ? task.title : '未知任务'}</td>
+                        <td>${currentUser.name}</td>
+                        <td><span class="badge bg-primary">${labels}</span></td>
+                        <td>${new Date(annotation.completed_at).toLocaleDateString()}</td>
+                        <td>
+                            <button class="btn btn-sm btn-outline-primary me-1" onclick="viewAnnotation('${annotation.id}')">查看</button>
+                            <button class="btn btn-sm btn-outline-danger" onclick="deleteAnnotation('${annotation.id}')">删除</button>
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+            
+            tbody.innerHTML = rows;
+        }
+
+        // 加载看板
+        function loadBoard() {
+            const content = document.getElementById('board-content');
+            if (tasks.length === 0) {
+                content.innerHTML = `
+                    <div class="text-center text-muted">
+                        <i class="fas fa-columns fa-3x mb-3"></i>
+                        <p>暂无任务数据</p>
+                    </div>
+                `;
+                return;
+            }
+            
+            // 按状态分组任务
+            const tasksByStatus = {
+                'open': tasks.filter(t => t.status === 'open'),
+                'assigned': tasks.filter(t => t.status === 'assigned'),
+                'in_progress': tasks.filter(t => t.status === 'in_progress'),
+                'done': tasks.filter(t => t.status === 'done')
+            };
+            
+            const boardHtml = `
+                <div class="row">
+                    <div class="col-md-3">
+                        <div class="card">
+                            <div class="card-header bg-secondary text-white">
+                                <h6 class="mb-0">开放 (${tasksByStatus.open.length})</h6>
+                            </div>
+                            <div class="card-body">
+                                ${tasksByStatus.open.map(task => createTaskCard(task)).join('')}
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="card">
+                            <div class="card-header bg-info text-white">
+                                <h6 class="mb-0">已分配 (${tasksByStatus.assigned.length})</h6>
+                            </div>
+                            <div class="card-body">
+                                ${tasksByStatus.assigned.map(task => createTaskCard(task)).join('')}
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="card">
+                            <div class="card-header bg-warning text-white">
+                                <h6 class="mb-0">进行中 (${tasksByStatus.in_progress.length})</h6>
+                            </div>
+                            <div class="card-body">
+                                ${tasksByStatus.in_progress.map(task => createTaskCard(task)).join('')}
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="card">
+                            <div class="card-header bg-success text-white">
+                                <h6 class="mb-0">已完成 (${tasksByStatus.done.length})</h6>
+                            </div>
+                            <div class="card-body">
+                                ${tasksByStatus.done.map(task => createTaskCard(task)).join('')}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+            
+            content.innerHTML = boardHtml;
+        }
+
+        // 创建任务卡片
+        function createTaskCard(task) {
+            return `
+                <div class="card task-card mb-2">
+                    <div class="card-body p-2">
+                        <h6 class="card-title mb-1">${task.title}</h6>
+                        <p class="card-text small text-muted">${task.content.substring(0, 50)}...</p>
+                        <div class="d-flex justify-content-between align-items-center">
+                            <small class="text-muted">${new Date(task.created_at).toLocaleDateString()}</small>
+                            <div>
+                                ${task.tags.map(tag => `<span class="badge bg-light text-dark me-1">${tag}</span>`).join('')}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        // 显示创建项目模态框
+        function showCreateProjectModal() {
+            new bootstrap.Modal(document.getElementById('createProjectModal')).show();
+        }
+
+        // 创建项目
+        function createProject() {
+            const name = document.getElementById('project-name').value;
+            const slug = document.getElementById('project-slug').value;
+            const tags = document.getElementById('project-tags').value.split(',').map(t => t.trim()).filter(t => t);
+            
+            if (!name || !slug) {
+                alert('请填写项目名称和Slug');
+                return;
+            }
+            
+            const newProject = {
+                id: Date.now().toString(),
+                name: name,
+                slug: slug,
+                status: 'active',
+                tags: tags,
+                created_at: new Date().toISOString()
+            };
+            
+            projects.push(newProject);
+            loadProjects();
+            updateDashboard();
+            
+            // 关闭模态框
+            bootstrap.Modal.getInstance(document.getElementById('createProjectModal')).hide();
+            
+            // 清空表单
+            document.getElementById('create-project-form').reset();
+            
+            alert('项目创建成功！');
+        }
+
+        // 显示创建任务模态框
+        function showCreateTaskModal() {
+            new bootstrap.Modal(document.getElementById('createTaskModal')).show();
+        }
+
+        // 创建任务
+        function createTask() {
+            const title = document.getElementById('task-title').value;
+            const content = document.getElementById('task-content').value;
+            const tags = document.getElementById('task-tags').value.split(',').map(t => t.trim()).filter(t => t);
+            
+            if (!title || !content) {
+                alert('请填写任务标题和内容');
+                return;
+            }
+            
+            const newTask = {
+                id: Date.now().toString(),
+                title: title,
+                content: content,
+                status: 'open',
+                tags: tags,
+                created_at: new Date().toISOString()
+            };
+            
+            tasks.push(newTask);
+            loadTasks();
+            updateDashboard();
+            
+            // 关闭模态框
+            bootstrap.Modal.getInstance(document.getElementById('createTaskModal')).hide();
+            
+            // 清空表单
+            document.getElementById('create-task-form').reset();
+            
+            alert('任务创建成功！');
+        }
+
+        // 显示标注模态框
+        function showAnnotationModal() {
+            // 填充任务选择下拉框
+            const taskSelect = document.getElementById('annotation-task-select');
+            taskSelect.innerHTML = '<option value="">请选择任务</option>' + 
+                tasks.map(task => `<option value="${task.id}">${task.title}</option>`).join('');
+            
+            new bootstrap.Modal(document.getElementById('annotationModal')).show();
+        }
+
+        // 创建标注
+        function createAnnotation() {
+            const taskId = document.getElementById('annotation-task-select').value;
+            const sentiment = document.querySelector('input[name="sentiment"]:checked');
+            const roles = document.querySelectorAll('input[name="role"]:checked');
+            const notes = document.getElementById('annotation-notes').value;
+            
+            if (!taskId || !sentiment) {
+                alert('请选择任务和情感标注');
+                return;
+            }
+            
+            const labels = [
+                { group_id: 'g_sentiment', option_ids: [sentiment.value] }
+            ];
+            
+            if (roles.length > 0) {
+                labels.push({
+                    group_id: 'g_role',
+                    option_ids: Array.from(roles).map(r => r.value)
+                });
+            }
+            
+            const newAnnotation = {
+                id: Date.now().toString(),
+                task_id: taskId,
+                labels: labels,
+                notes: notes,
+                completed_at: new Date().toISOString()
+            };
+            
+            annotations.push(newAnnotation);
+            loadAnnotations();
+            updateDashboard();
+            
+            // 关闭模态框
+            bootstrap.Modal.getInstance(document.getElementById('annotationModal')).hide();
+            
+            // 清空表单
+            document.getElementById('annotation-form').reset();
+            
+            alert('标注提交成功！');
+        }
+
+        // 测试API
+        function testAPI() {
+            const endpoint = document.getElementById('api-endpoint').value;
+            const testData = document.getElementById('test-data').value;
+            
+            if (!endpoint) {
+                alert('请输入API端点');
+                return;
+            }
+            
+            // 模拟API调用
+            console.log('测试API端点:', endpoint);
+            console.log('测试数据:', testData);
+            
+            alert('API测试完成，请查看控制台输出');
+        }
+
+        // 其他功能函数
+        function viewProject(id) {
+            const project = projects.find(p => p.id === id);
+            if (project) {
+                alert(`项目详情：\n名称：${project.name}\nSlug：${project.slug}\n状态：${project.status}\n标签：${project.tags.join(', ')}`);
+            }
+        }
+
+        function deleteProject(id) {
+            if (confirm('确定要删除这个项目吗？')) {
+                projects = projects.filter(p => p.id !== id);
+                loadProjects();
+                updateDashboard();
+                alert('项目删除成功！');
+            }
+        }
+
+        function viewTask(id) {
+            const task = tasks.find(t => t.id === id);
+            if (task) {
+                alert(`任务详情：\n标题：${task.title}\n内容：${task.content}\n状态：${task.status}\n标签：${task.tags.join(', ')}`);
+            }
+        }
+
+        function editTask(id) {
+            alert('编辑任务功能待实现');
+        }
+
+        function deleteTask(id) {
+            if (confirm('确定要删除这个任务吗？')) {
+                tasks = tasks.filter(t => t.id !== id);
+                loadTasks();
+                updateDashboard();
+                alert('任务删除成功！');
+            }
+        }
+
+        function viewAnnotation(id) {
+            const annotation = annotations.find(a => a.id === id);
+            if (annotation) {
+                const labels = annotation.labels.map(label => 
+                    `${label.group_id}: ${label.option_ids.join(', ')}`
+                ).join('\n');
+                alert(`标注详情：\n标签：\n${labels}\n备注：${annotation.notes || '无'}`);
+            }
+        }
+
+        function deleteAnnotation(id) {
+            if (confirm('确定要删除这个标注吗？')) {
+                annotations = annotations.filter(a => a.id !== id);
+                loadAnnotations();
+                updateDashboard();
+                alert('标注删除成功！');
+            }
+        }
+    </script>
+</body>
+</html>
+
+
+
