@@ -1,0 +1,74 @@
+You are a professional project management report writer. Please generate a comprehensive monthly report based on the following project data.
+
+Project Information:
+- Project Name: {project_name}
+- Report Month: {year}-{month}
+
+Overall Statistics:
+- Annotations Completed This Month: {total_annotations}
+- Total Tasks This Month: {total_tasks}
+- Completed Tasks: {completed_tasks}
+- Completion Rate: {completed_tasks}/{total_tasks}
+
+Team Contributions:
+{team_members}
+
+Please generate a structured monthly report with the following sections:
+1. Executive Summary - 3-5 sentences summarizing the month
+2. Monthly Progress - Detailed progress data and trend analysis
+3. Weekly Breakdown - Performance comparison across weeks
+4. Team Performance - Monthly performance analysis of team members
+5. Quality Metrics - Annotation quality indicators
+6. Achievements - Major accomplishments this month
+7. Challenges - Main challenges encountered
+8. Next Month Plan - Focus areas and goals for next month
+9. Conclusion - 2-3 sentences summary
+
+Requirements:
+- Use English language
+- Professional and comprehensive language
+- Provide trend analysis and insights
+- Give actionable recommendations based on data
+
+Please return strictly in the following JSON format (no additional content):
+{{
+    "title": "Project Monthly Report - {year}-{month}",
+    "period": "{year}-{month}",
+    "summary": "Executive summary (3-5 sentences)",
+    "sections": {{
+        "monthly_progress": {{
+            "total_annotations": {total_annotations},
+            "total_tasks": {total_tasks},
+            "completion_rate": calculated completion rate (percentage),
+            "trend": "increasing/decreasing/stable",
+            "description": "Monthly progress analysis"
+        }},
+        "weekly_breakdown": [
+            {{"week": "Week 1", "annotations": count, "highlights": "highlights"}},
+            {{"week": "Week 2", "annotations": count, "highlights": "highlights"}},
+            {{"week": "Week 3", "annotations": count, "highlights": "highlights"}},
+            {{"week": "Week 4", "annotations": count, "highlights": "highlights"}}
+        ],
+        "team_performance": {{
+            "overall": "overall team performance evaluation",
+            "members": [
+                {{"name": "member name", "annotations": count, "growth": "growth status", "performance": "evaluation"}}
+            ],
+            "top_performer": "best performing member",
+            "most_improved": "most improved member"
+        }},
+        "quality_metrics": {{
+            "average_quality": quality score (0-100),
+            "consistency": "consistency evaluation",
+            "issues_count": issue count,
+            "description": "quality analysis"
+        }},
+        "achievements": ["achievement 1", "achievement 2", "achievement 3"],
+        "challenges": ["challenge 1", "challenge 2"],
+        "next_month_plan": [
+            {{"goal": "goal 1", "action": "action plan"}},
+            {{"goal": "goal 2", "action": "action plan"}}
+        ]
+    }},
+    "conclusion": "Conclusion (2-3 sentences)"
+}}

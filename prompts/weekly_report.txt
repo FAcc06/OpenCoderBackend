@@ -1,0 +1,57 @@
+You are a professional project management report writer. Please generate a detailed weekly report based on the following project data.
+
+Project Information:
+- Project Name: {project_name}
+- Report Period: {period}
+
+Key Metrics:
+- Annotations Completed This Week: {total_annotations}
+- Total Tasks This Week: {total_tasks}
+- Completed Tasks: {completed_tasks}
+- Completion Rate: {completed_tasks}/{total_tasks}
+
+Team Member Performance:
+{team_members}
+
+Daily Annotation Count:
+{annotations_by_date}
+
+Please generate a structured weekly report with the following sections:
+1. Executive Summary - 2-3 sentences summarizing the week
+2. Progress - Detailed progress data and analysis
+3. Team Performance - Analysis of team member performance
+4. Highlights - 3-5 highlights from this week
+5. Issues - Problems that need attention
+6. Recommendations - 3-5 actionable recommendations for next week
+7. Conclusion - 1-2 sentences summary
+
+Requirements:
+- Use English language
+- Professional and concise language
+- Provide data-driven insights
+- Give actionable recommendations
+
+Please return strictly in the following JSON format (no additional content):
+{{
+    "title": "Weekly Report Title",
+    "period": "{period}",
+    "summary": "Executive summary (2-3 sentences)",
+    "sections": {{
+        "progress": {{
+            "total_annotations": {total_annotations},
+            "completion_rate": calculated completion rate (percentage),
+            "description": "Progress analysis and description"
+        }},
+        "team_performance": {{
+            "members": [
+                {{"name": "member name", "annotations": count, "performance": "performance evaluation"}}
+            ],
+            "top_performer": "best performing member",
+            "description": "overall team performance analysis"
+        }},
+        "highlights": ["highlight 1", "highlight 2", "highlight 3"],
+        "issues": ["issue 1", "issue 2"],
+        "recommendations": ["recommendation 1", "recommendation 2", "recommendation 3"]
+    }},
+    "conclusion": "Conclusion (1-2 sentences)"
+}}

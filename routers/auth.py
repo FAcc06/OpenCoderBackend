@@ -35,7 +35,11 @@ oauth.register(
     client_id=os.getenv('GOOGLE_CLIENT_ID'),
     client_secret=os.getenv('GOOGLE_CLIENT_SECRET'),
     server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
-    client_kwargs={'scope': 'openid email profile'}
+    client_kwargs={
+        'scope': 'openid email profile https://www.googleapis.com/auth/drive.file',
+        'access_type': 'offline',  # 获取 refresh_token
+        'prompt': 'consent'  # 强制显示授权页面以获取 refresh_token
+    }
 )
 
 # JWT 配置
@@ -247,6 +251,21 @@ async def google_callback(request: Request):
         
         # 获取或创建用户
         user_id = await get_or_create_user(email, name, avatar_url)
+        
+        # 保存 Google credentials（用于 Drive API）
+        core_db = get_core_db()
+        google_credentials = {
+            "access_token": token.get('access_token'),
+            "refresh_token": token.get('refresh_token'),  # 可能为 None（如果用户已授权过）
+            "token_expiry": datetime.utcnow() + timedelta(seconds=token.get('expires_in', 3600)),
+            "scopes": token.get('scope', '').split() if token.get('scope') else []
+        }
+        
+        await core_db.users.update_one(
+            {"_id": ObjectId(user_id)},
+            {"$set": {"google_credentials": google_credentials}}
+        )
+        logger.info(f"Saved Google credentials for user {user_id}")
         
         # 创建 JWT 令牌
         access_token = create_access_token(

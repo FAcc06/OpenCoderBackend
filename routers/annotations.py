@@ -284,7 +284,22 @@ async def submit_annotation_and_get_next(
             )
             next_assignment["state"] = AssignmentState.IN_PROGRESS
     
-    # 11. 返回结果
+    # 11. 检查是否完成所有任务，如果是则自动通知Manager
+    if not next_assignment:
+        # 没有下一个任务了，可能完成所有任务
+        from routers.notifications import check_and_notify_all_tasks_completed
+        try:
+            notification_sent = await check_and_notify_all_tasks_completed(
+                project_id=project_id,
+                coder_user_id=coder_user_id_str
+            )
+            if notification_sent:
+                print(f"✅ Auto-notification sent: Coder {coder_user_id_str} completed all tasks")
+        except Exception as e:
+            print(f"⚠️  Failed to send auto-notification: {e}")
+            # 不影响主流程，继续
+    
+    # 12. 返回结果
     from models import Assignment
     return {
         "submitted": {
