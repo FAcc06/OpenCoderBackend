@@ -85,8 +85,7 @@ async def create_project_indexes(db):
     # Tasks集合索引
     await db.tasks.create_index("status")
     await db.tasks.create_index("tags")
-    # 确保任务文本唯一性（避免重复任务）
-    await db.tasks.create_index("payload.text", unique=True, sparse=True)
+    await db.tasks.create_index("task_type")
     
     # Assignments集合索引
     await db.assignments.create_index([("task_id", 1), ("coder_user_id", 1)], unique=True)
@@ -99,6 +98,15 @@ async def create_project_indexes(db):
     # Tag groups集合索引
     await db.tag_groups.create_index("group_id", unique=True)
     await db.tag_groups.create_index("active")
+    
+    # Chat conversations集合索引
+    await db.conversations.create_index("participants")
+    await db.conversations.create_index("type")
+    await db.conversations.create_index("updated_at")
+    
+    # Chat messages集合索引
+    await db.chat_messages.create_index([("conversation_id", 1), ("created_at", -1)])
+    await db.chat_messages.create_index("sender_id")
 
 def get_core_db():
     """获取核心数据库连接"""

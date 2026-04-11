@@ -53,6 +53,11 @@ class TagGroupType(str, Enum):
     SINGLE = "single"
     MULTI = "multi"
 
+class TaskType(str, Enum):
+    TEXT = "text"
+    URL = "url"
+    IMAGE = "image"
+
 # 基础模型
 class BaseModelWithTimestamp(BaseModel):
     model_config = ConfigDict(
@@ -124,14 +129,27 @@ class ApplicationUpdate(BaseModel):
     status: ApplicationStatus
 
 # 任务模型
+class ImageData(BaseModel):
+    """图片数据结构"""
+    drive_file_id: str
+    drive_file_url: str
+    drive_view_url: Optional[str] = None
+    drive_thumbnail_url: Optional[str] = None
+    original_filename: str
+    file_size: int
+    mime_type: str
+    uploaded_at: Optional[datetime] = None
+
 class TaskPayload(BaseModel):
     text: Optional[str] = None
     url: Optional[str] = None
+    image: Optional[ImageData] = None
     meta: Dict[str, Any] = {}
 
 class Task(BaseModelWithTimestamp):
     id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
     title: str
+    task_type: TaskType = TaskType.TEXT
     payload: TaskPayload
     status: TaskStatus = TaskStatus.OPEN
     tags: List[str] = []
@@ -264,3 +282,40 @@ class BoardItem(BaseModel):
 class BoardResponse(BaseModel):
     items: List[BoardItem]
     total: int
+
+# ============== Chat Models ==============
+
+class OnlineState(str, Enum):
+    ONLINE = "online"
+    OFFLINE = "offline"
+    INVISIBLE = "invisible"
+
+class ConversationType(str, Enum):
+    GLOBAL = "global"
+    PROJECT_GROUP = "project_group"
+    P2P = "p2p"
+
+class UserChatStatus(BaseModel):
+    online_state: OnlineState = OnlineState.OFFLINE
+    last_seen: datetime = Field(default_factory=datetime.utcnow)
+
+class Conversation(BaseModelWithTimestamp):
+    id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
+    type: ConversationType
+    participants: List[PyObjectId]
+    project_id: Optional[PyObjectId] = None
+    name: Optional[str] = None
+    last_message: Optional[Dict[str, Any]] = None
+
+class ChatMessage(BaseModelWithTimestamp):
+    id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
+    conversation_id: PyObjectId
+    sender_id: PyObjectId
+    content: str
+    message_type: str = "text"
+    read_by: List[PyObjectId] = []
+    
+class ChatMessageCreate(BaseModel):
+    conversation_id: str
+    content: str
+    message_type: str = "text"

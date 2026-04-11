@@ -1,12 +1,17 @@
-from fastapi import APIRouter, HTTPException, Depends, status
+from fastapi import APIRouter, HTTPException, Depends, status, UploadFile, File, Form, Query
 from typing import List, Optional
 from bson import ObjectId
+import json
 
 from database import get_core_db, get_project_db
-from models import Task, TaskCreate, TaskBulkCreate, TaskUpdate, TaskStatus, PaginatedResponse, User
+from models import Task, TaskCreate, TaskBulkCreate, TaskUpdate, TaskStatus, TaskType, PaginatedResponse, User
+from routers.auth import verify_token
+from services.google_drive import GoogleDriveService
 from utils import paginate_query, calculate_pages
-from datetime import datetime
+from datetime import datetime, timedelta
+import logging
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 @router.post("/{project_id}/tasks/bulk", response_model=List[Task])
@@ -224,3 +229,201 @@ async def delete_task(
     await project_db.tasks.delete_one({"_id": task_oid})
     
     return {"message": "Task deleted successfully"}
+
+
+@router.post("/{project_id}/tasks/upload-image")
+async def upload_image_task(
+    project_id: str,
+    title: str = Form(...),
+    tags: str = Form("[]"),
+    image: UploadFile = File(...),
+    token: str = Query(...)
+):
+    """
+    上传图片任务（使用 Manager 的 Drive 统一存储）
+    
+    流程：
+    1. 验证用户权限
+    2. 获取项目 Manager 的 Google Drive 授权
+    3. 上传图片到 Manager 的 Drive
+    4. 分享给所有项目成员
+    5. 创建图片类型的任务
+    """
+    # 验证用户
+    try:
+        user_data = verify_token(token)
+        user_id = user_data.get("sub")
+    except Exception as e:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    
+    core_db = get_core_db()
+    
+    # 检查项目是否存在
+    try:
+        project_oid = ObjectId(project_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid project ID")
+    
+    project = await core_db.projects.find_one({"_id": project_oid})
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    # 验证用户是否属于该项目
+    user = await core_db.users.find_one({"_id": ObjectId(user_id)})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    if str(user.get("project_id")) != project_id:
+        raise HTTPException(status_code=403, detail="User not in this project")
+    
+    # 获取项目 Manager 的 Google credentials
+    manager_id = project.get("owner_user_id")
+    if not manager_id:
+        raise HTTPException(status_code=500, detail="Project manager not found")
+    
+    manager = await core_db.users.find_one({"_id": manager_id})
+    if not manager:
+        raise HTTPException(status_code=404, detail="Manager not found")
+    
+    google_creds = manager.get("google_credentials")
+    if not google_creds or not google_creds.get("access_token"):
+        raise HTTPException(
+            status_code=400,
+            detail="Manager's Google Drive not authorized. Manager needs to login again to grant Drive access."
+        )
+    
+    # 检查是否有 refresh_token
+    if not google_creds.get("refresh_token"):
+        raise HTTPException(
+            status_code=400,
+            detail="Manager's Google credentials are incomplete. Please logout and login again with Google to grant full Drive access."
+        )
+    
+    # 验证文件类型
+    if not image.content_type or not image.content_type.startswith('image/'):
+        raise HTTPException(status_code=400, detail="Only image files are allowed")
+    
+    # 读取文件内容
+    try:
+        file_content = await image.read()
+        file_size = len(file_content)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read file: {str(e)}")
+    
+    # 限制文件大小 (10MB)
+    if file_size > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Image size exceeds 10MB limit")
+    
+    logger.info(f"User {user_id} uploading image task: {image.filename} ({file_size} bytes) to Manager's Drive")
+    
+    # 初始化 Google Drive 服务（使用 Manager 的凭证）
+    try:
+        drive_service = GoogleDriveService(
+            access_token=google_creds["access_token"],
+            refresh_token=google_creds.get("refresh_token")
+        )
+    except Exception as e:
+        logger.error(f"Failed to initialize Drive service: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to initialize Google Drive: {str(e)}")
+    
+    # 获取或创建项目文件夹
+    project_folder_id = project.get("drive_folder_id")
+    if not project_folder_id:
+        logger.info("Creating project folder in Manager's Drive")
+        try:
+            project_name = project.get("name", f"Project_{project_id}")
+            project_folder_id = drive_service.create_project_folder(f"OpenCoder_{project_name}")
+            
+            # 保存到项目文档
+            await core_db.projects.update_one(
+                {"_id": project_oid},
+                {"$set": {"drive_folder_id": project_folder_id}}
+            )
+            logger.info(f"Project folder created: {project_folder_id}")
+        except Exception as e:
+            logger.error(f"Failed to create project folder: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to create project folder: {str(e)}")
+    
+    # 上传图片到 Manager 的 Google Drive
+    try:
+        drive_result = drive_service.upload_image(
+            file_content=file_content,
+            filename=image.filename,
+            mime_type=image.content_type,
+            folder_id=project_folder_id
+        )
+        
+        logger.info(f"Image uploaded to Manager's Drive: {drive_result['drive_file_id']}")
+        
+    except Exception as e:
+        logger.error(f"Failed to upload to Drive: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to upload to Google Drive: {str(e)}")
+    
+    # 注意：图片已在 upload_image 中设置为"任何人有链接可查看"
+    # 这样可以直接在 <img> 标签中加载，无需额外认证
+    logger.info(f"Image is public via link (anyone with link can view)")
+    
+    # 如果 token 被刷新，更新 Manager 的数据库
+    if drive_service.access_token != google_creds["access_token"]:
+        logger.info("Manager's access token was refreshed, updating database")
+        await core_db.users.update_one(
+            {"_id": ObjectId(manager_id)},
+            {
+                "$set": {
+                    "google_credentials.access_token": drive_service.access_token,
+                    "google_credentials.token_expiry": datetime.utcnow() + timedelta(seconds=3600)
+                }
+            }
+        )
+    
+    # 解析标签
+    try:
+        tags_list = json.loads(tags) if tags else []
+    except Exception:
+        tags_list = []
+    
+    # 创建图片任务
+    project_db = await get_project_db(project_id)
+    
+    task_doc = {
+        "title": title,
+        "task_type": "image",
+        "payload": {
+            "text": None,
+            "url": None,
+            "image": {
+                **drive_result,
+                "uploaded_at": datetime.utcnow()
+            },
+            "meta": {}
+        },
+        "status": "open",
+        "tags": tags_list,
+        "created_by": ObjectId(user_id),
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow()
+    }
+    
+    try:
+        result = await project_db.tasks.insert_one(task_doc)
+        task_doc["_id"] = result.inserted_id
+        
+        logger.info(f"Created image task: {result.inserted_id}")
+        
+        return {
+            "success": True,
+            "task_id": str(result.inserted_id),
+            "image_url": drive_result["drive_file_url"],
+            "message": "Image task created successfully"
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to create task: {e}")
+        # 如果任务创建失败，尝试删除已上传的图片
+        try:
+            drive_service.delete_file(drive_result["drive_file_id"])
+            logger.info("Rolled back: deleted uploaded image")
+        except Exception:
+            pass
+        
+        raise HTTPException(status_code=500, detail=f"Failed to create task: {str(e)}")

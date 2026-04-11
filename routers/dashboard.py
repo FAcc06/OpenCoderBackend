@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, Query
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
 from bson import ObjectId
+from collections import defaultdict
 
 from database import get_core_db, get_project_db
 from models import PaginatedResponse
@@ -449,3 +450,183 @@ def calculate_completion_rate(status_dist: List[Dict]) -> float:
     completed = status_counts.get("done", 0)
     
     return round(completed / max(total, 1) * 100, 1)
+
+
+@router.get("/{project_id}/analytics/tag-statistics")
+async def get_tag_statistics(project_id: str, token: str = Query(...)):
+    """
+    获取项目中所有标签的统计数据，按tag group分组
+    
+    返回格式:
+    {
+        "success": true,
+        "statistics": {
+            "by_group": [
+                {
+                    "group_id": "sentiment",
+                    "group_name": "Sentiment",
+                    "total_annotations": 150,
+                    "tags": [
+                        {"tag_value": "positive", "tag_label": "Positive", "count": 80},
+                        {"tag_value": "negative", "tag_label": "Negative", "count": 50},
+                        {"tag_value": "neutral", "tag_label": "Neutral", "count": 20}
+                    ]
+                },
+                ...
+            ],
+            "total_annotations": 300,
+            "unique_tags": 15,
+            "tag_groups_count": 5
+        }
+    }
+    """
+    core_db = get_core_db()
+    
+    try:
+        project_oid = ObjectId(project_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid project ID")
+    
+    # 检查项目是否存在
+    project = await core_db.projects.find_one({"_id": project_oid})
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    # 获取项目数据库
+    project_db = await get_project_db(project_id)
+    if project_db is None:
+        raise HTTPException(status_code=404, detail="Project database not found")
+    
+    # 获取项目的tag groups定义
+    tag_groups_cursor = project_db.tag_groups.find({})
+    tag_groups_list = await tag_groups_cursor.to_list(None)
+    
+    # 构建tag group映射 {group_id: {group_name, options: {option_id: label}, label_to_id: {label: option_id}}}
+    tag_groups_map = {}
+    for group in tag_groups_list:
+        options_map = {}
+        label_to_id_map = {}  # 反向映射：从label找option_id
+        
+        for option in group.get("options", []):
+            # 兼容不同的数据结构
+            option_id = option.get("option_id") or option.get("value") or option.get("label")
+            option_label = option.get("label", option_id)
+            
+            # option_id -> label
+            options_map[option_id] = option_label
+            # label -> option_id (反向映射)
+            label_to_id_map[option_label.lower()] = option_id
+        
+        tag_groups_map[group.get("group_id")] = {
+            "group_name": group.get("name", group.get("group_id")),
+            "options": options_map,
+            "label_to_id": label_to_id_map,
+            "type": group.get("type", "single")
+        }
+    
+    # 获取所有标注数据
+    annotations_cursor = project_db.annotations.find({})
+    annotations_list = await annotations_cursor.to_list(None)
+    
+    # 统计标签数据
+    # 结构: {group_id: {option_id: count}}
+    # 注意：统一使用option_id作为key，避免重复
+    tag_counts = defaultdict(lambda: defaultdict(int))
+    
+    for annotation in annotations_list:
+        labels = annotation.get("labels", {})
+        
+        # labels可能是不同的格式，需要兼容处理
+        if isinstance(labels, list):
+            # 数组格式 (实际系统使用的格式)
+            # [{"group_id": "...", "option_ids": ["..."]}]
+            for label_item in labels:
+                if isinstance(label_item, dict):
+                    group_id = label_item.get("group_id")
+                    option_ids = label_item.get("option_ids", [])
+                    
+                    if group_id and option_ids:
+                        label_map = tag_groups_map.get(group_id, {}).get("label_to_id", {})
+                        for option_id in option_ids:
+                            # 规范化为option_id（如果是label名，转换为option_id）
+                            normalized_id = label_map.get(str(option_id).lower(), str(option_id))
+                            tag_counts[group_id][normalized_id] += 1
+        
+        elif isinstance(labels, dict):
+            # 字典格式 (旧格式或其他格式)
+            for group_id, value in labels.items():
+                label_map = tag_groups_map.get(group_id, {}).get("label_to_id", {})
+                
+                # value可能是单个值、列表或对象
+                if isinstance(value, list):
+                    # 列表形式
+                    for tag_value in value:
+                        normalized_id = label_map.get(str(tag_value).lower(), str(tag_value))
+                        tag_counts[group_id][normalized_id] += 1
+                elif isinstance(value, dict):
+                    # 对象形式 {selected: [...]}
+                    selected = value.get("selected", [])
+                    if isinstance(selected, list):
+                        for tag_value in selected:
+                            normalized_id = label_map.get(str(tag_value).lower(), str(tag_value))
+                            tag_counts[group_id][normalized_id] += 1
+                    else:
+                        normalized_id = label_map.get(str(selected).lower(), str(selected))
+                        tag_counts[group_id][normalized_id] += 1
+                else:
+                    # 单个值
+                    normalized_id = label_map.get(str(value).lower(), str(value))
+                    tag_counts[group_id][normalized_id] += 1
+    
+    # 构建返回数据
+    by_group = []
+    total_annotations_count = len(annotations_list)
+    unique_tags_count = 0
+    
+    for group_id, group_info in tag_groups_map.items():
+        group_data = {
+            "group_id": group_id,
+            "group_name": group_info["group_name"],
+            "type": group_info["type"],
+            "total_annotations": 0,
+            "tags": []
+        }
+        
+        # 获取该组的标签统计
+        group_tag_counts = tag_counts.get(group_id, {})
+        
+        # 统计时已经规范化，直接使用
+        for option_id, count in group_tag_counts.items():
+            # 获取标签显示名称
+            tag_label = group_info["options"].get(option_id, option_id)
+            
+            group_data["tags"].append({
+                "tag_value": option_id,
+                "tag_label": tag_label,
+                "count": count
+            })
+            group_data["total_annotations"] += count
+            unique_tags_count += 1
+        
+        # 按count排序
+        group_data["tags"].sort(key=lambda x: x["count"], reverse=True)
+        
+        if group_data["tags"]:  # 只包含有数据的组
+            by_group.append(group_data)
+    
+    # 按total_annotations排序
+    by_group.sort(key=lambda x: x["total_annotations"], reverse=True)
+    
+    return {
+        "success": True,
+        "statistics": {
+            "by_group": by_group,
+            "total_annotations": total_annotations_count,
+            "unique_tags": unique_tags_count,
+            "tag_groups_count": len(by_group)
+        },
+        "metadata": {
+            "project_id": project_id,
+            "generated_at": datetime.utcnow().isoformat()
+        }
+    }
