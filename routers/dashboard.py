@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, Query
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, timedelta
 from bson import ObjectId
 from collections import defaultdict
@@ -8,6 +8,209 @@ from database import get_core_db, get_project_db
 from models import PaginatedResponse
 
 router = APIRouter()
+
+
+def _build_tag_groups_map(tag_groups_list: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Same shape as get_tag_statistics: group_id -> name, options, label_to_id, type."""
+    tag_groups_map: Dict[str, Dict[str, Any]] = {}
+    for group in tag_groups_list:
+        options_map: Dict[str, str] = {}
+        label_to_id_map: Dict[str, str] = {}
+        for option in group.get("options", []):
+            option_id = option.get("option_id") or option.get("value") or option.get("label")
+            option_label = option.get("label", option_id)
+            options_map[option_id] = option_label
+            label_to_id_map[str(option_label).lower()] = option_id
+        gid = group.get("group_id")
+        if not gid:
+            continue
+        tag_groups_map[gid] = {
+            "group_name": group.get("name", gid),
+            "options": options_map,
+            "label_to_id": label_to_id_map,
+            "type": group.get("type", "single"),
+        }
+    return tag_groups_map
+
+
+def _ann_time(ann: Dict[str, Any]) -> datetime:
+    t = ann.get("completed_at") or ann.get("created_at")
+    if isinstance(t, datetime):
+        return t
+    return datetime.min.replace(tzinfo=None)
+
+
+def _normalize_labels_dict(annotation: Dict[str, Any], tag_groups_map: Dict[str, Dict[str, Any]]) -> Dict[str, Tuple[str, ...]]:
+    """group_id -> sorted tuple of normalized option_ids (for agreement compare)."""
+    out: Dict[str, Tuple[str, ...]] = {}
+    labels = annotation.get("labels", [])
+
+    def norm_oid(group_id: str, raw: Any) -> str:
+        label_map = tag_groups_map.get(group_id, {}).get("label_to_id", {})
+        return label_map.get(str(raw).lower(), str(raw))
+
+    if isinstance(labels, list):
+        for label_item in labels:
+            if not isinstance(label_item, dict):
+                continue
+            group_id = label_item.get("group_id")
+            option_ids = label_item.get("option_ids", [])
+            if not group_id or not option_ids:
+                continue
+            norm = sorted({norm_oid(group_id, oid) for oid in option_ids})
+            if norm:
+                out[group_id] = tuple(norm)
+    elif isinstance(labels, dict):
+        for group_id, value in labels.items():
+            if group_id not in tag_groups_map:
+                continue
+            label_map = tag_groups_map[group_id].get("label_to_id", {})
+            parts: List[str] = []
+            if isinstance(value, list):
+                for tag_value in value:
+                    parts.append(label_map.get(str(tag_value).lower(), str(tag_value)))
+            elif isinstance(value, dict):
+                selected = value.get("selected", [])
+                if isinstance(selected, list):
+                    for tag_value in selected:
+                        parts.append(label_map.get(str(tag_value).lower(), str(tag_value)))
+                else:
+                    parts.append(label_map.get(str(selected).lower(), str(selected)))
+            else:
+                parts.append(label_map.get(str(value).lower(), str(value)))
+            norm = sorted(set(parts))
+            if norm:
+                out[group_id] = tuple(norm)
+    return out
+
+
+def _value_key(tup: Tuple[str, ...]) -> str:
+    return "|".join(tup)
+
+
+def _cohen_kappa_from_pairs(pair_counts: Dict[Tuple[str, str], int]) -> Optional[float]:
+    """
+    Weighted Cohen's kappa from (rater_low_id_order_label, rater_high_id_order_label) counts.
+    Categories are string keys (multi: joined by |).
+    """
+    if not pair_counts:
+        return None
+    categories = set()
+    for (a, b), _ in pair_counts.items():
+        categories.add(a)
+        categories.add(b)
+    cats = sorted(categories)
+    if len(cats) < 2:
+        # no disagreement possible across categories — undefined or perfect
+        total = sum(pair_counts.values())
+        if total == 0:
+            return None
+        diag = sum(c for (a, b), c in pair_counts.items() if a == b)
+        return 1.0 if diag == total else None
+    K = len(cats)
+    idx = {c: i for i, c in enumerate(cats)}
+    mat = [[0] * K for _ in range(K)]
+    n = 0
+    for (a, b), c in pair_counts.items():
+        if a not in idx or b not in idx:
+            continue
+        mat[idx[a]][idx[b]] += c
+        n += c
+    if n == 0:
+        return None
+    Po = sum(mat[i][i] for i in range(K)) / n
+    row_m = [sum(mat[i][j] for j in range(K)) / n for i in range(K)]
+    col_m = [sum(mat[i][j] for i in range(K)) / n for j in range(K)]
+    Pe = sum(row_m[i] * col_m[i] for i in range(K))
+    denom = 1.0 - Pe
+    if abs(denom) < 1e-12:
+        return None
+    return round((Po - Pe) / denom, 4)
+
+@router.get("/{project_id}/analytics/consensus-statistics")
+async def get_consensus_statistics(project_id: str):
+    """
+    获取 consensus 统计信息
+    - 有冲突的任务总数（至少 2 个 coder 标注且标签不完全一致）
+    - 已解决的冲突数（有 is_consensus=True 的 annotation）
+    """
+    core_db = get_core_db()
+    
+    try:
+        project_oid = ObjectId(project_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid project ID")
+    
+    project = await core_db.projects.find_one({"_id": project_oid})
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    project_db = await get_project_db(project_id)
+    if project_db is None:
+        raise HTTPException(status_code=404, detail="Project database not found")
+    
+    # 获取所有非 consensus 的 annotations
+    annotations_list = await project_db.annotations.find({
+        "is_consensus": {"$ne": True}
+    }).to_list(None)
+    
+    # 按 task_id 分组，找出每个 task 的所有标注
+    from collections import defaultdict
+    task_annotations = defaultdict(list)
+    for ann in annotations_list:
+        tid = ann.get("task_id")
+        if tid:
+            task_annotations[tid].append(ann)
+    
+    # 统计有冲突的任务（至少 2 个 coder 且标签不完全一致）
+    tasks_with_conflicts = []
+    
+    for task_id, anns in task_annotations.items():
+        if len(anns) < 2:
+            continue
+        
+        # 检查是否有冲突（比较 labels）
+        labels_set = set()
+        for ann in anns:
+            labels = ann.get("labels", "")
+            # 规范化 labels 用于比较
+            if isinstance(labels, list):
+                # 转为可哈希的字符串
+                labels_str = str(sorted([
+                    (item.get('group_id', ''), tuple(sorted(item.get('option_ids', []))))
+                    for item in labels if isinstance(item, dict)
+                ]))
+            else:
+                labels_str = str(labels)
+            labels_set.add(labels_str)
+        
+        # 如果有多于 1 种不同的标签组合，说明有冲突
+        if len(labels_set) > 1:
+            tasks_with_conflicts.append(task_id)
+    
+    total_conflicts = len(tasks_with_conflicts)
+    
+    # 统计已解决的冲突（有 is_consensus=True 的任务）
+    resolved_tasks = await project_db.annotations.find({
+        "is_consensus": True
+    }).distinct("task_id")
+    
+    resolved_count = len(resolved_tasks)
+    
+    return {
+        "success": True,
+        "statistics": {
+            "total_conflicts": total_conflicts,
+            "resolved_conflicts": resolved_count,
+            "unresolved_conflicts": total_conflicts - resolved_count,
+            "resolution_rate": round(100.0 * resolved_count / total_conflicts, 2) if total_conflicts > 0 else 0
+        },
+        "metadata": {
+            "project_id": project_id,
+            "generated_at": datetime.utcnow().isoformat()
+        }
+    }
+
 
 @router.get("/{project_id}/coders")
 async def get_project_coders(project_id: str):
@@ -497,32 +700,8 @@ async def get_tag_statistics(project_id: str, token: str = Query(...)):
     if project_db is None:
         raise HTTPException(status_code=404, detail="Project database not found")
     
-    # 获取项目的tag groups定义
-    tag_groups_cursor = project_db.tag_groups.find({})
-    tag_groups_list = await tag_groups_cursor.to_list(None)
-    
-    # 构建tag group映射 {group_id: {group_name, options: {option_id: label}, label_to_id: {label: option_id}}}
-    tag_groups_map = {}
-    for group in tag_groups_list:
-        options_map = {}
-        label_to_id_map = {}  # 反向映射：从label找option_id
-        
-        for option in group.get("options", []):
-            # 兼容不同的数据结构
-            option_id = option.get("option_id") or option.get("value") or option.get("label")
-            option_label = option.get("label", option_id)
-            
-            # option_id -> label
-            options_map[option_id] = option_label
-            # label -> option_id (反向映射)
-            label_to_id_map[option_label.lower()] = option_id
-        
-        tag_groups_map[group.get("group_id")] = {
-            "group_name": group.get("name", group.get("group_id")),
-            "options": options_map,
-            "label_to_id": label_to_id_map,
-            "type": group.get("type", "single")
-        }
+    tag_groups_list = await project_db.tag_groups.find({}).to_list(None)
+    tag_groups_map = _build_tag_groups_map(tag_groups_list)
     
     # 获取所有标注数据
     annotations_cursor = project_db.annotations.find({})
@@ -630,3 +809,144 @@ async def get_tag_statistics(project_id: str, token: str = Query(...)):
             "generated_at": datetime.utcnow().isoformat()
         }
     }
+
+
+async def compute_intercoder_reliability_response(project_id: str) -> dict:
+    """
+    Shared implementation for intercoder metrics (dashboard + /api/projects/...).
+
+    Tasks with **two or more distinct coders**; per coder, latest annotation per task.
+    """
+    core_db = get_core_db()
+    try:
+        project_oid = ObjectId(project_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid project ID")
+
+    project = await core_db.projects.find_one({"_id": project_oid})
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project_db = await get_project_db(project_id)
+    if project_db is None:
+        raise HTTPException(status_code=404, detail="Project database not found")
+
+    tag_groups_list = await project_db.tag_groups.find({}).to_list(None)
+    tag_groups_map = _build_tag_groups_map(tag_groups_list)
+    if not tag_groups_map:
+        return {
+            "success": True,
+            "reliability": {
+                "tasks_with_two_plus_coders": 0,
+                "description": "No tag groups configured.",
+                "by_group": [],
+            },
+            "metadata": {"project_id": project_id, "generated_at": datetime.utcnow().isoformat()},
+        }
+
+    annotations_list = await project_db.annotations.find({}).to_list(None)
+
+    # task_id -> coder_id -> latest annotation
+    task_coder_best: Dict[Any, Dict[Any, Dict[str, Any]]] = defaultdict(dict)
+    for ann in annotations_list:
+        tid = ann.get("task_id")
+        cid = ann.get("coder_user_id")
+        if tid is None or cid is None:
+            continue
+        prev = task_coder_best[tid].get(cid)
+        if prev is None or _ann_time(ann) >= _ann_time(prev):
+            task_coder_best[tid][cid] = ann
+
+    multi_tasks: List[Tuple[Any, Dict[Any, Dict[str, Any]]]] = [
+        (tid, cm) for tid, cm in task_coder_best.items() if len(cm) >= 2
+    ]
+    tasks_two_plus = len(multi_tasks)
+
+    by_group_out: List[Dict[str, Any]] = []
+
+    for group_id, ginfo in tag_groups_map.items():
+        eligible = 0
+        unanimous = 0
+        pairwise_sum = 0.0
+        pairwise_tasks = 0
+        pair_counts: Dict[Tuple[str, str], int] = defaultdict(int)
+        two_rater_tasks = 0
+
+        for _tid, codermap in multi_tasks:
+            rows: List[Tuple[Any, Tuple[str, ...]]] = []
+            for cid, ann in codermap.items():
+                nd = _normalize_labels_dict(ann, tag_groups_map)
+                if group_id not in nd:
+                    continue
+                rows.append((cid, nd[group_id]))
+            if len(rows) < 2:
+                continue
+            eligible += 1
+            vals = [r[1] for r in rows]
+            if len(set(vals)) == 1:
+                unanimous += 1
+
+            n = len(rows)
+            if n >= 2:
+                agree_pairs = 0
+                total_pairs = 0
+                for i in range(n):
+                    for j in range(i + 1, n):
+                        total_pairs += 1
+                        if rows[i][1] == rows[j][1]:
+                            agree_pairs += 1
+                if total_pairs:
+                    pairwise_sum += agree_pairs / total_pairs
+                    pairwise_tasks += 1
+
+            if len(rows) == 2:
+                two_rater_tasks += 1
+                (c1, v1), (c2, v2) = sorted(rows, key=lambda x: str(x[0]))
+                k1 = _value_key(v1)
+                k2 = _value_key(v2)
+                pair_counts[(k1, k2)] += 1
+
+        pct = round(100.0 * unanimous / eligible, 2) if eligible else None
+        mpair = round(100.0 * pairwise_sum / pairwise_tasks, 2) if pairwise_tasks else None
+        kappa = _cohen_kappa_from_pairs(pair_counts) if two_rater_tasks else None
+
+        by_group_out.append(
+            {
+                "group_id": group_id,
+                "group_name": ginfo["group_name"],
+                "type": ginfo["type"],
+                "eligible_tasks": eligible,
+                "unanimous_tasks": unanimous,
+                "percent_agreement": pct,
+                "mean_pairwise_agreement_percent": mpair,
+                "two_rater_tasks": two_rater_tasks,
+                "cohens_kappa": kappa,
+            }
+        )
+
+    by_group_out.sort(key=lambda x: x.get("eligible_tasks", 0), reverse=True)
+    by_group_out = [g for g in by_group_out if g["eligible_tasks"] > 0]
+
+    return {
+        "success": True,
+        "reliability": {
+            "tasks_with_two_plus_coders": tasks_two_plus,
+            "description": (
+                "Tasks where at least two distinct coders submitted an annotation; "
+                "per coder the latest annotation per task is used. "
+                "Cohen's κ uses only tasks where exactly two coders labeled this group."
+            ),
+            "by_group": by_group_out,
+        },
+        "metadata": {
+            "project_id": project_id,
+            "generated_at": datetime.utcnow().isoformat(),
+        },
+    }
+
+
+@router.get("/{project_id}/analytics/intercoder-reliability")
+@router.get("/{project_id}/intercoder-reliability")
+async def get_intercoder_reliability(project_id: str, token: str = Query(...)):
+    del token
+    return await compute_intercoder_reliability_response(project_id)
