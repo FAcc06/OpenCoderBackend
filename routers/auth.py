@@ -37,8 +37,13 @@ oauth.register(
     server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
     client_kwargs={
         'scope': 'openid email profile https://www.googleapis.com/auth/drive.file',
-        'access_type': 'offline',  # 获取 refresh_token
-        'prompt': 'consent'  # 强制显示授权页面以获取 refresh_token
+        'access_type': 'offline',
+        'prompt': 'consent',
+        'include_granted_scopes': 'true'  # 包含之前授予的 scopes
+    },
+    authorize_params={
+        'access_type': 'offline',
+        'prompt': 'consent'
     }
 )
 
@@ -200,7 +205,14 @@ async def google_login(request: Request, redirect_uri: Optional[str] = None):
         request.session['frontend_redirect_uri'] = redirect_uri
         logger.info(f"Stored frontend redirect URI in session: {redirect_uri}")
     
-    return await oauth.google.authorize_redirect(request, REDIRECT_URI)
+    # 显式指定授权参数，确保获取 Drive 权限和 refresh_token
+    return await oauth.google.authorize_redirect(
+        request, 
+        REDIRECT_URI,
+        access_type='offline',
+        prompt='consent',
+        include_granted_scopes='true'
+    )
 
 
 @router.get('/google/callback', tags=["authentication"])
@@ -225,6 +237,12 @@ async def google_callback(request: Request):
         # 获取访问令牌
         token = await oauth.google.authorize_access_token(request)
         logger.info("Successfully obtained access token from Google")
+        
+        # 🔍 调试：打印 Google 返回的完整 token 信息
+        logger.info(f"📊 Google token keys: {token.keys()}")
+        logger.info(f"🔑 Has refresh_token: {bool(token.get('refresh_token'))}")
+        logger.info(f"📋 Scope returned: {token.get('scope')}")
+        logger.info(f"⏰ Expires in: {token.get('expires_in')}")
         
         # 获取用户信息
         user_info = token.get('userinfo')
@@ -254,18 +272,34 @@ async def google_callback(request: Request):
         
         # 保存 Google credentials（用于 Drive API）
         core_db = get_core_db()
+        
+        # 🔍 调试：检查 Google 返回的 scopes
+        scope_string = token.get('scope', '')
+        scope_list = scope_string.split() if scope_string else []
+        has_drive_scope = 'https://www.googleapis.com/auth/drive.file' in scope_list
+        
+        logger.info(f"📋 Scopes returned by Google: {scope_list}")
+        logger.info(f"🔑 Has drive.file scope: {has_drive_scope}")
+        logger.info(f"🔄 Has refresh_token: {bool(token.get('refresh_token'))}")
+        
+        if not has_drive_scope:
+            logger.warning("⚠️ Google did not grant Drive scope! Check OAuth consent screen configuration.")
+        
+        if not token.get('refresh_token'):
+            logger.warning("⚠️ Google did not provide refresh_token! User may need to revoke access first.")
+        
         google_credentials = {
             "access_token": token.get('access_token'),
-            "refresh_token": token.get('refresh_token'),  # 可能为 None（如果用户已授权过）
+            "refresh_token": token.get('refresh_token'),
             "token_expiry": datetime.utcnow() + timedelta(seconds=token.get('expires_in', 3600)),
-            "scopes": token.get('scope', '').split() if token.get('scope') else []
+            "scopes": scope_list
         }
         
         await core_db.users.update_one(
             {"_id": ObjectId(user_id)},
             {"$set": {"google_credentials": google_credentials}}
         )
-        logger.info(f"Saved Google credentials for user {user_id}")
+        logger.info(f"✅ Saved Google credentials for user {user_id}")
         
         # 创建 JWT 令牌
         access_token = create_access_token(
