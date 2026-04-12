@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends, status
+from fastapi import APIRouter, HTTPException, Depends, status, Query
 from typing import List, Optional
 from bson import ObjectId
 from pydantic import BaseModel
@@ -252,3 +252,15 @@ async def get_cluster_uri_status(project_id: str):
         "cluster_uri": cluster_uri,
         "cluster_uri_masked": f"{cluster_uri[:20]}...{cluster_uri[-10:]}" if cluster_uri and len(cluster_uri) > 30 else cluster_uri
     }
+
+
+@router.get("/{project_id}/intercoder-reliability")
+async def get_intercoder_reliability_via_projects(project_id: str, token: str = Query(...)):
+    """
+    Same JSON as GET /api/dashboard/{project_id}/intercoder-reliability.
+    Mounted under /api/projects for environments where dashboard sub-routes return 404.
+    """
+    del token
+    from routers.dashboard import compute_intercoder_reliability_response
+
+    return await compute_intercoder_reliability_response(project_id)

@@ -130,6 +130,19 @@ async def export_annotations_csv(
     )
 
 
+@router.get("/{project_id}/intercoder-reliability")
+async def export_intercoder_reliability_json(project_id: str, token: str = Query(...)):
+    """
+    Intercoder reliability JSON (same payload as dashboard). Uses /api/exports prefix so it is not
+    shadowed by other routers mounted on /api/projects.
+    """
+    user = verify_token(token)
+    await verify_manager(user, project_id)
+    from routers.dashboard import compute_intercoder_reliability_response
+
+    return await compute_intercoder_reliability_response(project_id)
+
+
 @router.get("/{project_id}/tasks/csv")
 async def export_tasks_csv(
     project_id: str,
@@ -408,12 +421,12 @@ async def export_annotations_excel(
 async def export_complete_data(
     project_id: str,
     token: str = Query(...),
-    format: str = Query("excel", description="Export format: 'excel' or 'zip'")
+    format: str = Query("excel", description="Export format: 'zip' (UTF-8 CSV files in archive) or 'excel' (.xlsx)")
 ):
     """
     导出项目完整数据
+    - format='zip': ZIP 压缩包，内含多个 UTF-8 CSV（annotations, tasks, coders, tag_groups）+ README.txt
     - format='excel': 单个 Excel 文件，包含多个 sheet
-    - format='zip': ZIP 压缩包，包含多个 CSV 文件
     需要 Manager 权限
     """
     user = verify_token(token)

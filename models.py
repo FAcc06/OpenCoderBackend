@@ -133,6 +133,7 @@ class ImageData(BaseModel):
     """图片数据结构"""
     drive_file_id: str
     drive_file_url: str
+    drive_cdn_url: Optional[str] = None
     drive_view_url: Optional[str] = None
     drive_thumbnail_url: Optional[str] = None
     original_filename: str
