@@ -399,10 +399,18 @@ async def generate_weekly_summary(
         team_members = project_data.get("team_members", [])
         active_coders = len([m for m in team_members if m.get("tasks_completed", 0) > 0])
         
+        # 获取最近的 annotations 详细数据（用于生成更详细的报告）
+        annotations_data = project_data.get("annotations", [])
+        annotations_by_date = project_data.get("annotations_by_date", {})
+        
         # 使用 LLM 生成简洁总结
         model = "anthropic/claude-3.5-haiku"
         
-        prompt = f"""Based on the following project data, write a concise 2-3 paragraph summary of this week's progress. Focus on key achievements and insights. Write in Chinese.
+        # 构建更详细的 prompt，包含 annotation 趋势
+        daily_summary = "\n".join([f"  - {date}: {count} annotations" 
+                                   for date, count in sorted(annotations_by_date.items())[:7]])
+        
+        prompt = f"""Based on the following project data, write a concise 2-3 paragraph summary of this week's progress. Focus on key achievements and insights. Write in English.
 
 Project Data (Last 7 Days):
 - Total annotations: {total_annotations}
@@ -410,6 +418,9 @@ Project Data (Last 7 Days):
 - Completed tasks: {completed_tasks}
 - Completion rate: {completion_rate:.1f}%
 - Active team members: {active_coders}
+
+Daily annotation breakdown:
+{daily_summary if daily_summary else "  - No detailed data available"}
 
 Please write a brief, professional summary suitable for a weekly report."""
 
@@ -432,8 +443,18 @@ Please write a brief, professional summary suitable for a weekly report."""
                 "stats": {
                     "annotations": total_annotations,
                     "completion_rate": f"{completion_rate:.1f}%",
-                    "active_coders": active_coders
-                }
+                    "active_coders": active_coders,
+                    "completed_tasks": completed_tasks,
+                    "total_tasks": total_tasks
+                },
+                "daily_breakdown": annotations_by_date,
+                "team_performance": [
+                    {
+                        "name": m.get("name", "Unknown"),
+                        "annotations": m.get("annotations_count", 0)
+                    }
+                    for m in team_members
+                ]
             }
         }
         

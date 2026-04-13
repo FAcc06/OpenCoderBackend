@@ -105,15 +105,23 @@ async def get_tasks(
     if tags:
         query["tags"] = {"$in": tags.split(",")}
     
-    # 如果查询 open 或 pending 任务，排除已分配的任务
+    # 如果查询 open 或 pending 任务，排除已被分配满（2次）的任务
     if status in ["open", "pending"]:
-        # 获取所有已分配的任务 ID
-        assigned_tasks = await project_db.assignments.find({}, {"task_id": 1}).to_list(length=None)
-        assigned_task_ids = [a["task_id"] for a in assigned_tasks]
+        # 使用聚合管道统计每个任务的分配次数
+        pipeline = [
+            {"$group": {
+                "_id": "$task_id",
+                "assignment_count": {"$sum": 1}
+            }},
+            {"$match": {"assignment_count": {"$gte": 2}}}  # 已分配2次或以上
+        ]
         
-        # 排除已分配的任务
-        if assigned_task_ids:
-            query["_id"] = {"$nin": assigned_task_ids}
+        fully_assigned = await project_db.assignments.aggregate(pipeline).to_list(None)
+        fully_assigned_task_ids = [doc["_id"] for doc in fully_assigned]
+        
+        # 排除已分配满的任务
+        if fully_assigned_task_ids:
+            query["_id"] = {"$nin": fully_assigned_task_ids}
     
     # 获取总数
     total = await project_db.tasks.count_documents(query)
