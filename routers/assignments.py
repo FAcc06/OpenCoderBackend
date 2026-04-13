@@ -42,13 +42,23 @@ async def create_assignments(
     
     # 批量插入
     assignment_dicts = [assignment.dict(by_alias=True) for assignment in assignments]
-    result = await project_db.assignments.insert_many(assignment_dicts)
     
-    # 更新分配ID
-    for i, assignment in enumerate(assignments):
-        assignment.id = result.inserted_ids[i]
-    
-    return assignments
+    try:
+        result = await project_db.assignments.insert_many(assignment_dicts)
+        
+        # 更新分配ID
+        for i, assignment in enumerate(assignments):
+            assignment.id = result.inserted_ids[i]
+        
+        return assignments
+    except Exception as e:
+        # 处理重复分配错误
+        if "duplicate key error" in str(e) or "E11000" in str(e):
+            raise HTTPException(
+                status_code=400,
+                detail="One or more tasks are already assigned to this coder. Please check existing assignments."
+            )
+        raise HTTPException(status_code=500, detail=f"Failed to create assignments: {str(e)}")
 
 @router.get("/{project_id}/assignments", response_model=PaginatedResponse)
 async def get_assignments(

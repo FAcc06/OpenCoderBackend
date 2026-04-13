@@ -348,6 +348,102 @@ async def generate_weekly_report(
         raise HTTPException(status_code=500, detail=f"Failed to generate report: {str(e)}")
 
 
+@router.post("/api/llm/weekly-summary")
+async def generate_weekly_summary(
+    project_id: str = Query(...),
+    token: str = Query(...)
+):
+    """
+    生成极简周报 - 只返回几段话的总结
+    
+    响应格式：
+    ```json
+    {
+        "success": true,
+        "summary": "本周团队完成了250个标注任务...",
+        "generated_at": "2024-01-22T10:00:00Z"
+    }
+    ```
+    """
+    # 验证用户权限
+    try:
+        user = verify_token(token)
+        print(f"✅ [Weekly Summary] User verified: {user.get('email')}")
+    except Exception as e:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    
+    # 获取最近7天的数据
+    try:
+        from datetime import datetime, timedelta
+        end_date = datetime.utcnow()
+        start_date = end_date - timedelta(days=7)
+        
+        start_str = start_date.strftime("%Y-%m-%d")
+        end_str = end_date.strftime("%Y-%m-%d")
+        
+        print(f"📊 [Weekly Summary] Fetching data from {start_str} to {end_str}")
+        
+        project_data = await fetch_project_data(
+            project_id,
+            start_str,
+            end_str
+        )
+        
+        # 提取关键数据
+        total_annotations = len(project_data.get("annotations", []))
+        total_tasks = project_data.get("total_tasks", 0)
+        completed_tasks = project_data.get("completed_tasks", 0)
+        completion_rate = (completed_tasks / total_tasks * 100) if total_tasks > 0 else 0
+        
+        # 团队成员数据
+        team_members = project_data.get("team_members", [])
+        active_coders = len([m for m in team_members if m.get("tasks_completed", 0) > 0])
+        
+        # 使用 LLM 生成简洁总结
+        model = "anthropic/claude-3.5-haiku"
+        
+        prompt = f"""Based on the following project data, write a concise 2-3 paragraph summary of this week's progress. Focus on key achievements and insights. Write in Chinese.
+
+Project Data (Last 7 Days):
+- Total annotations: {total_annotations}
+- Total tasks: {total_tasks}
+- Completed tasks: {completed_tasks}
+- Completion rate: {completion_rate:.1f}%
+- Active team members: {active_coders}
+
+Please write a brief, professional summary suitable for a weekly report."""
+
+        messages = [
+            {"role": "system", "content": "You are a professional project manager summarizing weekly progress. Keep it concise and insightful."},
+            {"role": "user", "content": prompt}
+        ]
+        
+        response = await call_openrouter(messages, model=model)
+        
+        content = response["choices"][0]["message"]["content"].strip()
+        
+        return {
+            "success": True,
+            "summary": content,
+            "generated_at": datetime.utcnow().isoformat(),
+            "metadata": {
+                "model": model,
+                "period": f"{start_str} to {end_str}",
+                "stats": {
+                    "annotations": total_annotations,
+                    "completion_rate": f"{completion_rate:.1f}%",
+                    "active_coders": active_coders
+                }
+            }
+        }
+        
+    except Exception as e:
+        print(f"❌ [Weekly Summary] Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to generate summary: {str(e)}")
+
+
 @router.post("/api/llm/monthly-report")
 async def generate_monthly_report(
     request: MonthlyReportRequest,
