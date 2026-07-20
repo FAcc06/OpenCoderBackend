@@ -1,6 +1,6 @@
 """
 Google Drive 服务
-用于上传、管理和删除图片文件
+用于上传、管理和删除文件（图片、视频、音频等）
 """
 import os
 import io
@@ -86,7 +86,7 @@ class GoogleDriveService:
             logger.error(f"Failed to create folder: {e}")
             raise Exception(f"Failed to create Drive folder: {str(e)}")
     
-    def upload_image(
+    def upload_file(
         self, 
         file_content: bytes, 
         filename: str, 
@@ -94,12 +94,12 @@ class GoogleDriveService:
         folder_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        上传图片到 Google Drive
+        上传文件到 Google Drive（支持图片、视频、音频等所有文件类型）
         
         Args:
-            file_content: 图片文件的二进制内容
+            file_content: 文件的二进制内容
             filename: 文件名
-            mime_type: MIME 类型 (image/jpeg, image/png 等)
+            mime_type: MIME 类型 (image/*, video/*, audio/*, 等)
             folder_id: 目标文件夹 ID（可选）
             
         Returns:
@@ -155,16 +155,19 @@ class GoogleDriveService:
             
             # 返回文件信息
             # 使用适合网页显示的 URL 格式
-            # Google Drive 图片显示 URL 的最佳格式：
-            # 1. uc?export=view&id=FILE_ID - 直接显示图片（主要）
-            # 2. lh3.googleusercontent.com/d/FILE_ID - Google CDN（备用，更快）
+            # Google Drive 文件显示 URL：
+            # 1. uc?export=view&id=FILE_ID - 直接显示/播放（主要）
+            # 2. lh3.googleusercontent.com/d/FILE_ID - Google CDN（备用，图片更快）
+            # 3. uc?export=download&id=FILE_ID - 下载链接（视频/音频备用）
             display_url = f"https://drive.google.com/uc?export=view&id={file_id}"
-            cdn_url = f"https://lh3.googleusercontent.com/d/{file_id}"  # CDN 备选
+            download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+            cdn_url = f"https://lh3.googleusercontent.com/d/{file_id}"  # CDN 备选（主要用于图片）
             
             return {
                 "drive_file_id": file_id,
-                "drive_file_url": display_url,  # 主要显示URL
-                "drive_cdn_url": cdn_url,  # CDN备用URL（更快）
+                "drive_file_url": display_url,  # 主要显示/播放URL
+                "drive_download_url": download_url,  # 下载URL（视频/音频备用）
+                "drive_cdn_url": cdn_url,  # CDN备用URL（图片更快）
                 "drive_view_url": file_updated.get('webViewLink', f"https://drive.google.com/file/d/{file_id}/view"),
                 "drive_thumbnail_url": file_updated.get('thumbnailLink', ''),
                 "original_filename": filename,
@@ -175,6 +178,9 @@ class GoogleDriveService:
         except Exception as e:
             logger.error(f"Failed to upload file: {e}")
             raise Exception(f"Failed to upload to Drive: {str(e)}")
+    
+    # 保持向后兼容：upload_image 是 upload_file 的别名
+    upload_image = upload_file
     
     def delete_file(self, file_id: str) -> bool:
         """

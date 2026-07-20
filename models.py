@@ -57,6 +57,10 @@ class TaskType(str, Enum):
     TEXT = "text"
     URL = "url"
     IMAGE = "image"
+    VIDEO = "video"
+    AUDIO = "audio"
+    BIBLIOGRAPHIC = "bibliographic"
+    PDF_DOCUMENT_CODING = "pdf_document_coding"
 
 # 基础模型
 class BaseModelWithTimestamp(BaseModel):
@@ -141,10 +145,51 @@ class ImageData(BaseModel):
     mime_type: str
     uploaded_at: Optional[datetime] = None
 
+class VideoData(BaseModel):
+    """视频数据结构"""
+    drive_file_id: str
+    drive_file_url: str
+    drive_download_url: Optional[str] = None
+    drive_cdn_url: Optional[str] = None
+    drive_view_url: Optional[str] = None
+    drive_thumbnail_url: Optional[str] = None
+    original_filename: str
+    file_size: int
+    mime_type: str
+    uploaded_at: Optional[datetime] = None
+
+class AudioData(BaseModel):
+    """音频数据结构"""
+    drive_file_id: str
+    drive_file_url: str
+    drive_download_url: Optional[str] = None
+    drive_cdn_url: Optional[str] = None
+    drive_view_url: Optional[str] = None
+    drive_thumbnail_url: Optional[str] = None
+    original_filename: str
+    file_size: int
+    mime_type: str
+    uploaded_at: Optional[datetime] = None
+
+class PDFData(BaseModel):
+    """PDF文档数据结构"""
+    drive_file_id: str
+    drive_file_url: str
+    drive_download_url: Optional[str] = None
+    drive_view_url: Optional[str] = None
+    original_filename: str
+    file_size: int
+    mime_type: str
+    page_count: Optional[int] = None
+    uploaded_at: Optional[datetime] = None
+
 class TaskPayload(BaseModel):
     text: Optional[str] = None
     url: Optional[str] = None
     image: Optional[ImageData] = None
+    video: Optional[VideoData] = None
+    audio: Optional[AudioData] = None
+    pdf: Optional[PDFData] = None
     meta: Dict[str, Any] = {}
 
 class Task(BaseModelWithTimestamp):
@@ -158,6 +203,7 @@ class Task(BaseModelWithTimestamp):
 
 class TaskCreate(BaseModel):
     title: str
+    task_type: Optional[TaskType] = None  # Optional, defaults to TEXT in Task model
     payload: TaskPayload
     tags: List[str] = []
 
@@ -320,3 +366,83 @@ class ChatMessageCreate(BaseModel):
     conversation_id: str
     content: str
     message_type: str = "text"
+
+# ============== PDF Document Coding Models ==============
+
+class PDFDocument(BaseModelWithTimestamp):
+    """PDF文档模型"""
+    id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
+    task_id: PyObjectId
+    file_name: str
+    file_path: Optional[str] = None  # Optional local path if needed
+    drive_file_id: str
+    drive_file_url: str
+    mime_type: str = "application/pdf"
+    file_size: int
+    page_count: Optional[int] = None
+    uploaded_by: PyObjectId
+
+class PDFDocumentCreate(BaseModel):
+    task_id: str
+    file_name: str
+    drive_file_id: str
+    drive_file_url: str
+    file_size: int
+    page_count: Optional[int] = None
+
+class DocumentLevelCoding(BaseModelWithTimestamp):
+    """文档级别编码"""
+    id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
+    task_id: PyObjectId
+    document_id: PyObjectId
+    code_ids: List[PyObjectId] = []  # Can have multiple codes
+    coder_user_id: PyObjectId
+    note: Optional[str] = None
+
+class DocumentLevelCodingCreate(BaseModel):
+    document_id: str
+    code_ids: List[str]
+    note: Optional[str] = None
+
+class DocumentLevelCodingUpdate(BaseModel):
+    code_ids: Optional[List[str]] = None
+    note: Optional[str] = None
+
+class RectangleCoordinate(BaseModel):
+    """矩形坐标（标准化比例）"""
+    x_ratio: float  # x / pageWidth
+    y_ratio: float  # y / pageHeight
+    width_ratio: float  # width / pageWidth
+    height_ratio: float  # height / pageHeight
+    page_width: float  # 原始页面宽度
+    page_height: float  # 原始页面高度
+
+class PassageAnnotation(BaseModelWithTimestamp):
+    """段落级别标注"""
+    id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
+    task_id: PyObjectId
+    document_id: PyObjectId
+    page_number: int
+    selected_text: str
+    start_offset: Optional[int] = None  # Text start offset in page
+    end_offset: Optional[int] = None  # Text end offset in page
+    rectangles: List[RectangleCoordinate] = []  # Support multi-line selection
+    code_ids: List[PyObjectId] = []  # Can have multiple codes
+    coder_user_id: PyObjectId
+    note: Optional[str] = None
+
+class PassageAnnotationCreate(BaseModel):
+    document_id: str
+    page_number: int
+    selected_text: str
+    start_offset: Optional[int] = None
+    end_offset: Optional[int] = None
+    rectangles: List[Dict[str, float]] = []
+    code_ids: List[str] = []
+    note: Optional[str] = None
+
+class PassageAnnotationUpdate(BaseModel):
+    selected_text: Optional[str] = None
+    code_ids: Optional[List[str]] = None
+    note: Optional[str] = None
+    rectangles: Optional[List[Dict[str, float]]] = None

@@ -217,9 +217,13 @@ async def get_my_assignments(
 @router.get("/{project_id}/my-next-task")
 async def get_my_next_task(
     project_id: str,
-    token: str
+    token: str,
+    task_type: Optional[str] = None
 ):
     """获取当前 Coder 的下一个未完成任务 - 需要 Token 认证
+    
+    参数:
+    - task_type: 可选，过滤特定类型的任务 (text, image, video, audio, url)
     
     返回：任务详情 + 分配信息 + Tag Groups
     """
@@ -260,23 +264,56 @@ async def get_my_next_task(
     # 3. 获取项目数据库
     project_db = await get_project_db(project_id)
     
-    # 4. 查找第一个未完成的分配（按创建时间排序）
-    assignment = await project_db.assignments.find_one({
+    # 4. 查找未完成的分配（按创建时间排序）
+    # 需要跳过指向不存在任务的分配
+    assignment_query = {
         "coder_user_id": coder_user_id,
         "state": {"$in": [AssignmentState.ASSIGNED, AssignmentState.IN_PROGRESS]}
-    }, sort=[("created_at", 1)])
+    }
     
-    if not assignment:
+    all_assignments = await project_db.assignments.find(
+        assignment_query
+    ).sort("created_at", 1).to_list(length=None)
+    
+    if not all_assignments:
         raise HTTPException(
             status_code=404,
             detail="No pending tasks found. All tasks completed! 🎉"
         )
     
-    # 5. 获取任务详情
+    # 5. 查找第一个有效的分配（任务存在且符合类型要求）
     from models import Task, TagGroup
-    task = await project_db.tasks.find_one({"_id": assignment["task_id"]})
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
+    task = None
+    assignment = None
+    
+    for assgn in all_assignments:
+        t = await project_db.tasks.find_one({"_id": assgn["task_id"]})
+        if not t:
+            # 跳过指向不存在任务的分配
+            continue
+        
+        # 如果指定了 task_type，检查是否匹配
+        if task_type:
+            actual_type = t.get("task_type", "text")
+            if actual_type != task_type:
+                continue
+        
+        # 找到有效的任务和分配
+        task = t
+        assignment = assgn
+        break
+    
+    if not task or not assignment:
+        if task_type:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No pending {task_type} tasks found."
+            )
+        else:
+            raise HTTPException(
+                status_code=404,
+                detail="No pending tasks found. All tasks completed! 🎉"
+            )
     
     # 6. 获取 Tag Groups
     tag_groups = await project_db.tag_groups.find().sort("order", 1).to_list(length=None)
