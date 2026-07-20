@@ -18,7 +18,9 @@ from . import (
     chat,
     test_drive,
     exports,
-    consensus
+    consensus,
+    proxy,
+    pdf_coding
 )
 
 __all__ = [
@@ -38,5 +40,7 @@ __all__ = [
     'chat',
     'test_drive',
     'exports',
-    'consensus'
+    'consensus',
+    'proxy',
+    'pdf_coding'
 ]

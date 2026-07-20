@@ -8,7 +8,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 from database import connect_to_mongo, close_mongo_connection
-from routers import users, projects, applications, tasks, assignments, annotations, tag_groups, board, public, dashboard, auth, llm, notifications, chat, test_drive, exports, consensus
+from routers import users, projects, applications, tasks, assignments, annotations, tag_groups, board, public, dashboard, auth, llm, notifications, chat, test_drive, exports, consensus, proxy, pdf_coding
 
 # 加载环境变量
 load_dotenv()
@@ -96,6 +96,8 @@ app.include_router(llm.router, tags=["llm"])
 app.include_router(notifications.router, tags=["notifications"])
 app.include_router(chat.router, tags=["chat"])
 app.include_router(test_drive.router, tags=["test-drive"])
+app.include_router(proxy.router, prefix="/api", tags=["proxy"])
+app.include_router(pdf_coding.router, prefix="/api/projects", tags=["pdf-coding"])
 
 @app.get("/")
 async def root():
