@@ -262,31 +262,29 @@ async def get_board(project_id: str):
 
 @router.get("/projects/{project_id}/members")
 async def get_members(project_id: str):
-    """获取项目成员（无需认证）"""
+    """获取项目成员（无需认证）— from project_memberships"""
     try:
         core_db = get_core_db()
         if core_db is None:
             return {"members": [], "total": 0}
         
-        # 获取项目信息
         project = await core_db.projects.find_one({"_id": ObjectId(project_id)})
         if not project:
             return {"error": "项目不存在", "members": []}
-        
-        # 获取项目成员
-        members = await core_db.users.find({"project_id": ObjectId(project_id)}).to_list(length=None)
-        
-        # 添加项目所有者
-        owner = await core_db.users.find_one({"_id": project["owner_user_id"]})
-        if owner:
-            members.append(owner)
-        
-        # 转换ObjectId为字符串
-        for member in members:
-            if '_id' in member:
-                member['_id'] = str(member['_id'])
-            if 'project_id' in member and member['project_id']:
-                member['project_id'] = str(member['project_id'])
+
+        from services.membership_service import list_project_member_users
+        users = await list_project_member_users(core_db, ObjectId(project_id))
+        members = []
+        for u in users:
+            members.append({
+                "_id": u["id"],
+                "email": u.get("email"),
+                "name": u.get("name"),
+                "role": u.get("role"),
+                "roles": u.get("roles", []),
+                "avatar_url": u.get("avatar_url"),
+                "project_id": u.get("project_id"),
+            })
         
         return {"members": members, "total": len(members)}
     except Exception as e:

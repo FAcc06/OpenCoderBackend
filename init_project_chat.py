@@ -38,16 +38,21 @@ async def init_project_chats():
         
         project_db = client[db_name]
         
-        # 获取项目所有成员
-        members = await core_db.users.find({
-            "project_id": project_id
+        # 获取项目所有成员（memberships，非 active shell）
+        memberships = await core_db.project_memberships.find({
+            "project_id": project_id,
+            "status": "active",
         }).to_list(length=None)
-        
-        if not members:
+
+        participant_ids = [m["user_id"] for m in memberships if m.get("user_id")]
+        # Include owner if missing
+        owner = project.get("owner_user_id")
+        if owner and owner not in participant_ids and str(owner) not in [str(p) for p in participant_ids]:
+            participant_ids.append(owner)
+
+        if not participant_ids:
             print("   ⚠️  没有成员，跳过")
             continue
-        
-        participant_ids = [m["_id"] for m in members]
         print(f"   👥 找到 {len(participant_ids)} 个成员")
         
         # 检查是否已有项目群聊

@@ -57,6 +57,11 @@ async def create_indexes():
     # Applications集合索引
     await core_db.applications.create_index([("project_id", 1), ("applicant_user_id", 1)], unique=True)
 
+    # Transcription jobs集合索引
+    await core_db.transcription_jobs.create_index("status")
+    await core_db.transcription_jobs.create_index([("task_id", 1), ("project_id", 1)])
+    await core_db.transcription_jobs.create_index("created_at")
+
 async def get_project_db(project_id: str):
     """获取项目数据库连接"""
     global project_dbs
@@ -107,6 +112,14 @@ async def create_project_indexes(db):
     # Chat messages集合索引
     await db.chat_messages.create_index([("conversation_id", 1), ("created_at", -1)])
     await db.chat_messages.create_index("sender_id")
+
+    # Transcripts集合索引
+    await db.transcripts.create_index("task_id")
+    await db.transcripts.create_index([("task_id", 1), ("version", -1)])
+
+    # Transcript codings集合索引
+    await db.transcript_codings.create_index("task_id")
+    await db.transcript_codings.create_index([("task_id", 1), ("coder_user_id", 1)])
 
 def get_core_db():
     """获取核心数据库连接"""

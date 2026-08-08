@@ -1,4 +1,5 @@
-from fastapi import APIRouter, HTTPException, Depends, status
+from fastapi import APIRouter, HTTPException, Depends, status, Query
+from pydantic import BaseModel
 from typing import List, Optional
 from bson import ObjectId
 
@@ -8,6 +9,183 @@ from utils import validate_tag_group_constraints
 from datetime import datetime
 
 router = APIRouter()
+
+
+# ── Task Notes (reflexive memos) ──────────────────────────────────────────────
+
+class NoteUpsert(BaseModel):
+    content: str = ""
+
+
+@router.get("/{project_id}/tasks/{task_id}/note")
+async def get_task_note(project_id: str, task_id: str, token: str = Query(...)):
+    """Return the coder's reflexive note for this task (empty string if none yet)."""
+    from jose import jwt, JWTError
+    import os
+    SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
+    ALGORITHM  = os.getenv("ALGORITHM", "HS256")
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        coder_id = ObjectId(payload["sub"])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    try:
+        task_oid    = ObjectId(task_id)
+        project_oid = ObjectId(project_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid ID")
+
+    project_db = await get_project_db(project_id)
+    doc = await project_db.task_notes.find_one(
+        {"task_id": task_oid, "coder_user_id": coder_id}
+    )
+    return {
+        "task_id":   task_id,
+        "content":   doc["content"] if doc else "",
+        "updated_at": doc["updated_at"].isoformat() if doc else None,
+    }
+
+
+@router.put("/{project_id}/tasks/{task_id}/note")
+async def upsert_task_note(
+    project_id: str,
+    task_id:    str,
+    body:       NoteUpsert,
+    token:      str = Query(...),
+):
+    """Create or update the coder's reflexive note for this task."""
+    from jose import jwt, JWTError
+    import os
+    SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
+    ALGORITHM  = os.getenv("ALGORITHM", "HS256")
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        coder_id = ObjectId(payload["sub"])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    try:
+        task_oid    = ObjectId(task_id)
+        project_oid = ObjectId(project_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid ID")
+
+    now        = datetime.utcnow()
+    project_db = await get_project_db(project_id)
+
+    await project_db.task_notes.update_one(
+        {"task_id": task_oid, "coder_user_id": coder_id},
+        {"$set": {
+            "content":    body.content,
+            "project_id": project_oid,
+            "updated_at": now,
+        }, "$setOnInsert": {
+            "created_at": now,
+        }},
+        upsert=True,
+    )
+    return {"success": True, "updated_at": now.isoformat()}
+
+
+@router.get("/{project_id}/notes")
+async def list_my_notes(
+    project_id: str,
+    token: str = Query(...),
+    task_type: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    sort: str = "newest",
+    search: Optional[str] = None,
+    page: int = 1,
+    limit: int = 50,
+):
+    """Return notes written by the current coder with optional filtering and pagination."""
+    from jose import jwt
+    from datetime import datetime as dt
+    import os
+    SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
+    ALGORITHM  = os.getenv("ALGORITHM", "HS256")
+    try:
+        payload  = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        coder_id = ObjectId(payload["sub"])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    project_db = await get_project_db(project_id)
+
+    # ── Build notes query ────────────────────────────────────────────────────
+    notes_query: dict = {
+        "coder_user_id": coder_id,
+        "content": {"$nin": ["", None]},
+    }
+    if date_from or date_to:
+        date_filter: dict = {}
+        if date_from:
+            try:
+                date_filter["$gte"] = dt.fromisoformat(date_from)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid date_from (use YYYY-MM-DD)")
+        if date_to:
+            try:
+                date_filter["$lte"] = dt.fromisoformat(date_to).replace(hour=23, minute=59, second=59)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid date_to (use YYYY-MM-DD)")
+        notes_query["updated_at"] = date_filter
+
+    sort_dir = -1 if sort == "newest" else 1
+    all_notes = await (
+        project_db.task_notes.find(notes_query)
+        .sort("updated_at", sort_dir)
+        .to_list(length=5000)
+    )
+
+    # ── Batch-fetch task info ─────────────────────────────────────────────────
+    task_ids = list({n["task_id"] for n in all_notes})
+    task_query: dict = {"_id": {"$in": task_ids}}
+    if task_type and task_type != "all":
+        task_query["task_type"] = task_type
+    tasks_map = {
+        t["_id"]: t
+        async for t in project_db.tasks.find(task_query, {"title": 1, "task_type": 1})
+    }
+
+    # ── Build result, applying task_type + text search filters ───────────────
+    result = []
+    for n in all_notes:
+        t = tasks_map.get(n["task_id"])
+        if t is None:
+            # task_type filter excluded this task
+            if task_type and task_type != "all":
+                continue
+            t = {}
+        content    = n.get("content", "")
+        task_title = t.get("title", "Untitled")
+        if search:
+            q = search.lower()
+            if q not in task_title.lower() and q not in content.lower():
+                continue
+        result.append({
+            "note_id":    str(n["_id"]),
+            "task_id":    str(n["task_id"]),
+            "task_title": task_title,
+            "task_type":  t.get("task_type", ""),
+            "content":    content,
+            "updated_at": n["updated_at"].isoformat() if n.get("updated_at") else None,
+        })
+
+    total = len(result)
+    # Paginate
+    start = (page - 1) * limit
+    paginated = result[start: start + limit] if limit > 0 else result
+
+    return {
+        "notes":  paginated,
+        "total":  total,
+        "page":   page,
+        "limit":  limit,
+        "pages":  max(1, -(-total // limit)) if limit > 0 else 1,
+    }
 
 @router.post("/{project_id}/annotations", response_model=Annotation)
 async def create_annotation(

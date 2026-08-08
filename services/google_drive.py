@@ -4,12 +4,13 @@ Google Drive 服务
 """
 import os
 import io
+import json
 from typing import Optional, Dict, Any, List
-from datetime import datetime, timedelta
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 from google.auth.transport.requests import Request
+import httpx
 import logging
 
 logger = logging.getLogger(__name__)
@@ -51,10 +52,12 @@ class GoogleDriveService:
             )
         
         self.service = build('drive', 'v3', credentials=self.credentials)
-    
+
     @property
     def access_token(self) -> str:
-        """获取当前 access token"""
+        """获取当前有效的 access token（必要时自动刷新）"""
+        if self.credentials.expired and self.credentials.refresh_token:
+            self.credentials.refresh(Request())
         return self.credentials.token
     
     def create_project_folder(self, project_name: str) -> str:
@@ -181,6 +184,137 @@ class GoogleDriveService:
     
     # 保持向后兼容：upload_image 是 upload_file 的别名
     upload_image = upload_file
+
+    def create_resumable_upload_session(
+        self,
+        filename: str,
+        mime_type: str,
+        file_size: int,
+        folder_id: Optional[str] = None,
+        origin: Optional[str] = None,
+    ) -> str:
+        """
+        创建 Google Drive resumable 上传会话，返回供浏览器直传的 upload URL。
+        必须传入 Origin，浏览器才能跨域 PUT 到该 URL。
+        """
+        metadata: Dict[str, Any] = {"name": filename}
+        if folder_id:
+            metadata["parents"] = [folder_id]
+
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json; charset=UTF-8",
+            "X-Upload-Content-Type": mime_type,
+            "X-Upload-Content-Length": str(file_size),
+        }
+        if origin:
+            headers["Origin"] = origin
+
+        url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,size,mimeType"
+
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                response = client.post(url, headers=headers, content=json.dumps(metadata))
+
+            if response.status_code not in (200, 201):
+                logger.error(
+                    "Failed to start resumable session: %s %s",
+                    response.status_code,
+                    response.text,
+                )
+                raise Exception(
+                    f"Failed to start resumable upload session: {response.status_code} {response.text}"
+                )
+
+            upload_url = response.headers.get("Location")
+            if not upload_url:
+                raise Exception("Resumable upload session missing Location header")
+
+            logger.info("Created resumable upload session for %s", filename)
+            return upload_url
+        except Exception as e:
+            logger.error("Failed to create resumable session: %s", e)
+            raise Exception(f"Failed to create resumable upload session: {str(e)}")
+
+    def _build_file_result(
+        self,
+        file_id: str,
+        filename: Optional[str] = None,
+        mime_type: Optional[str] = None,
+        file_size: Optional[int] = None,
+        file_meta: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Build the standard drive_* URL payload used by task documents."""
+        meta = file_meta or {}
+        resolved_name = filename or meta.get("name") or "file"
+        resolved_mime = mime_type or meta.get("mimeType") or "application/octet-stream"
+        resolved_size = file_size
+        if resolved_size is None:
+            resolved_size = int(meta.get("size", 0) or 0)
+
+        display_url = f"https://drive.google.com/uc?export=view&id={file_id}"
+        download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+        cdn_url = f"https://lh3.googleusercontent.com/d/{file_id}"
+
+        return {
+            "drive_file_id": file_id,
+            "drive_file_url": display_url,
+            "drive_download_url": download_url,
+            "drive_cdn_url": cdn_url,
+            "drive_view_url": meta.get("webViewLink", f"https://drive.google.com/file/d/{file_id}/view"),
+            "drive_thumbnail_url": meta.get("thumbnailLink", ""),
+            "original_filename": resolved_name,
+            "file_size": resolved_size,
+            "mime_type": resolved_mime,
+        }
+
+    def file_in_folder(self, file_id: str, folder_id: str) -> bool:
+        """Return True if file_id has folder_id among its parents."""
+        try:
+            file = self.service.files().get(
+                fileId=file_id,
+                fields="id,parents",
+            ).execute()
+            parents = file.get("parents") or []
+            return folder_id in parents
+        except Exception as e:
+            logger.error("Failed to check file folder for %s: %s", file_id, e)
+            return False
+
+    def finalize_uploaded_file(
+        self,
+        file_id: str,
+        filename: Optional[str] = None,
+        mime_type: Optional[str] = None,
+        file_size: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        客户端直传完成后：设为 anyone-with-link 可读，并返回标准 URL 字段。
+        """
+        try:
+            permission = {"type": "anyone", "role": "reader"}
+            self.service.permissions().create(
+                fileId=file_id,
+                body=permission,
+                fields="id",
+            ).execute()
+            logger.info("Set file %s to public (anyone with link)", file_id)
+
+            file_updated = self.service.files().get(
+                fileId=file_id,
+                fields="id, name, size, mimeType, webViewLink, webContentLink, thumbnailLink",
+            ).execute()
+
+            return self._build_file_result(
+                file_id=file_id,
+                filename=filename,
+                mime_type=mime_type,
+                file_size=file_size,
+                file_meta=file_updated,
+            )
+        except Exception as e:
+            logger.error("Failed to finalize uploaded file %s: %s", file_id, e)
+            raise Exception(f"Failed to finalize uploaded file: {str(e)}")
     
     def delete_file(self, file_id: str) -> bool:
         """
@@ -271,10 +405,3 @@ class GoogleDriveService:
             'failed_count': len(failed_emails),
             'failed_emails': failed_emails
         }
-    
-    @property
-    def access_token(self) -> str:
-        """获取当前有效的 access token"""
-        if self.credentials.expired and self.credentials.refresh_token:
-            self.credentials.refresh(Request())
-        return self.credentials.token

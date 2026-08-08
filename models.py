@@ -29,6 +29,14 @@ class UserRole(str, Enum):
     MANAGER = "manager"
     CODER = "coder"
 
+class MembershipRole(str, Enum):
+    MANAGER = "manager"
+    CODER = "coder"
+
+class MembershipStatus(str, Enum):
+    ACTIVE = "active"
+    INACTIVE = "inactive"
+
 class ProjectStatus(str, Enum):
     ACTIVE = "active"
     ARCHIVED = "archived"
@@ -61,6 +69,7 @@ class TaskType(str, Enum):
     AUDIO = "audio"
     BIBLIOGRAPHIC = "bibliographic"
     PDF_DOCUMENT_CODING = "pdf_document_coding"
+    MULTIMODAL = "multimodal"
 
 # 基础模型
 class BaseModelWithTimestamp(BaseModel):
@@ -110,6 +119,15 @@ class ProjectCreate(BaseModel):
     name: str
     slug: str
     tags: List[str] = []
+
+# Per-project membership (source of truth for Hub)
+class ProjectMembership(BaseModelWithTimestamp):
+    id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
+    user_id: PyObjectId
+    project_id: PyObjectId
+    role: MembershipRole  # legacy primary role
+    roles: List[str] = []  # e.g. ["manager", "coder"]
+    status: MembershipStatus = MembershipStatus.ACTIVE
 
 # 申请模型
 class Application(BaseModelWithTimestamp):
@@ -200,12 +218,49 @@ class Task(BaseModelWithTimestamp):
     status: TaskStatus = TaskStatus.OPEN
     tags: List[str] = []
     created_by: PyObjectId
+    # Transcription fields (populated by worker)
+    transcription_status: Optional[str] = None
+    active_transcript_id: Optional[PyObjectId] = None
+    active_transcript_version: Optional[int] = None
 
 class TaskCreate(BaseModel):
     title: str
     task_type: Optional[TaskType] = None  # Optional, defaults to TEXT in Task model
     payload: TaskPayload
     tags: List[str] = []
+
+class InitMediaUploadRequest(BaseModel):
+    """Start a client-side resumable Drive upload session."""
+    filename: str
+    mime_type: str
+    file_size: int
+    media_type: str  # image | video | audio
+    origin: Optional[str] = None
+
+class FinalizeMediaUploadRequest(BaseModel):
+    """Create a task after the browser finished uploading to Drive."""
+    drive_file_id: str
+    title: str
+    media_type: str  # image | video | audio
+    tags: List[str] = []
+    original_filename: Optional[str] = None
+    file_size: Optional[int] = None
+    mime_type: Optional[str] = None
+
+class MultimodalMediaItem(BaseModel):
+    """One Drive file slot for a multimodal task (image | video | audio)."""
+    drive_file_id: str
+    media_type: str  # image | video | audio
+    original_filename: Optional[str] = None
+    file_size: Optional[int] = None
+    mime_type: Optional[str] = None
+
+class FinalizeMultimodalUploadRequest(BaseModel):
+    """Create one task with multiple media payload slots filled."""
+    title: str
+    items: List[MultimodalMediaItem]
+    tags: List[str] = []
+    text: Optional[str] = None  # optional accompanying text
 
 class TaskBulkCreate(BaseModel):
     tasks: List[TaskCreate]
@@ -253,6 +308,14 @@ class AnnotationCreate(BaseModel):
     task_id: PyObjectId
     labels: List[LabelOption]
     notes: Optional[str] = None
+
+# Reflexive memo — independent from annotation submission
+class TaskNote(BaseModelWithTimestamp):
+    id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
+    task_id: PyObjectId
+    project_id: PyObjectId
+    coder_user_id: PyObjectId
+    content: str = ""
 
 # 标签组模型
 class TagOption(BaseModel):
@@ -381,6 +444,10 @@ class PDFDocument(BaseModelWithTimestamp):
     file_size: int
     page_count: Optional[int] = None
     uploaded_by: PyObjectId
+    # Auto-extracted & summarised fields (populated by background task after upload)
+    extracted_text: Optional[str] = None
+    summary: Optional[str] = None
+    summary_model: Optional[str] = None
 
 class PDFDocumentCreate(BaseModel):
     task_id: str
@@ -446,3 +513,102 @@ class PassageAnnotationUpdate(BaseModel):
     code_ids: Optional[List[str]] = None
     note: Optional[str] = None
     rectangles: Optional[List[Dict[str, float]]] = None
+
+
+# ============== Transcription Models ==============
+
+class TranscriptionJobStatus(str, Enum):
+    QUEUED = "queued"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+class TranscriptionTaskStatus(str, Enum):
+    NONE = "none"
+    QUEUED = "queued"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+class TranscriptionJob(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+        arbitrary_types_allowed=True,
+        json_encoders={ObjectId: str}
+    )
+    id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
+    task_id: PyObjectId
+    project_id: PyObjectId
+    status: TranscriptionJobStatus = TranscriptionJobStatus.QUEUED
+    attempt_count: int = 0
+    max_attempts: int = 3
+    locked_at: Optional[datetime] = None
+    locked_by: Optional[str] = None
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+    transcript_id: Optional[PyObjectId] = None
+    created_by: PyObjectId
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+class TranscriptSegment(BaseModel):
+    index: int
+    start: float
+    end: float
+    text: str
+    start_word_index: Optional[int] = None
+    end_word_index: Optional[int] = None
+
+class TranscriptWord(BaseModel):
+    index: int
+    segment_index: Optional[int] = None
+    start: float
+    end: float
+    text: str
+
+class Transcript(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+        arbitrary_types_allowed=True,
+        json_encoders={ObjectId: str}
+    )
+    id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
+    task_id: PyObjectId
+    project_id: PyObjectId
+    version: int = 1
+    provider: str = "openrouter"
+    model: str = "openai/whisper-large-v3-turbo"
+    language: Optional[str] = None
+    duration_seconds: Optional[float] = None
+    text: str = ""
+    segments: List[TranscriptSegment] = []
+    words: List[TranscriptWord] = []
+    summary: Optional[str] = None
+    summary_model: Optional[str] = None
+    created_by: PyObjectId
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+class TranscriptCoding(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+        arbitrary_types_allowed=True,
+        json_encoders={ObjectId: str}
+    )
+    id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
+    task_id: PyObjectId
+    project_id: PyObjectId
+    coder_user_id: PyObjectId
+    labels: List[LabelOption] = []
+    notes: Optional[str] = None
+    target: Dict[str, Any]  # SegmentRangeTarget or WordRangeTarget as dict
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+class TranscriptCodingCreate(BaseModel):
+    task_id: str
+    labels: List[LabelOption]
+    notes: Optional[str] = None
+    target: Dict[str, Any]  # must contain type, transcript_id, transcript_version, indices, start, end, text_snapshot

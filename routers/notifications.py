@@ -108,12 +108,15 @@ async def check_and_notify_all_tasks_completed(project_id: str, coder_user_id: s
         if not project:
             return False
         
-        manager_id = project.get("owner_id")
-        if not manager_id:
-            print(f"⚠️  Project {project_id} has no owner_id")
+        from services.membership_service import get_project_manager_ids
+        try:
+            project_oid = ObjectId(project_id)
+        except Exception:
             return False
-        
-        manager_id = str(manager_id)
+        manager_oids = await get_project_manager_ids(core_db, project_oid)
+        if not manager_oids:
+            print(f"⚠️  Project {project_id} has no managers")
+            return False
         
         # 检查是否已经发送过此通知（避免重复）
         existing_notification = await core_db.notifications.find_one({
@@ -126,15 +129,18 @@ async def check_and_notify_all_tasks_completed(project_id: str, coder_user_id: s
         if existing_notification:
             return False  # 今天已经发送过了
         
-        # 发送通知
-        await create_notification(
-            project_id=project_id,
-            from_user_id=coder_user_id,
-            to_user_id=manager_id,
-            notification_type="all_tasks_completed",
-            message=f"{coder_name} has completed all assigned tasks ({total_assignments} tasks). Please review and assign new tasks.",
-            priority="high"
-        )
+        # Notify all managers (owner + membership managers)
+        for mid in manager_oids:
+            if str(mid) == str(coder_oid):
+                continue
+            await create_notification(
+                project_id=project_id,
+                from_user_id=coder_user_id,
+                to_user_id=str(mid),
+                notification_type="all_tasks_completed",
+                message=f"{coder_name} has completed all assigned tasks ({total_assignments} tasks). Please review and assign new tasks.",
+                priority="high"
+            )
         
         return True
     
@@ -176,9 +182,13 @@ async def send_notification(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     
-    manager_id = project.get("owner_id")
-    if not manager_id:
+    from services.membership_service import get_project_manager_ids
+    manager_oids = await get_project_manager_ids(core_db, ObjectId(str(project_id)))
+    if not manager_oids:
         raise HTTPException(status_code=400, detail="Project has no manager assigned")
+
+    # Prefer primary owner; fall back to first membership manager
+    manager_id = manager_oids[0]
     
     # 创建通知
     notification = await create_notification(
