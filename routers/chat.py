@@ -29,37 +29,40 @@ async def check_chat_permission(user_id: str, conversation_id: str, core_db, pro
     
     # 检查用户是否在参与者列表中
     user_oid = ObjectId(user_id)
-    if user_oid in conversation.get("participants", []):
+    participants = conversation.get("participants", [])
+    if user_oid in participants or str(user_id) in [str(p) for p in participants]:
         return True
     
-    # Manager 可以访问项目内所有对话
-    user = await core_db.users.find_one({"_id": user_oid})
-    if user and user.get("role") == "manager":
-        project_id = conversation.get("project_id")
-        if project_id and str(user.get("project_id")) == str(project_id):
+    # Manager (membership) can access all conversations in the project
+    project_id = conversation.get("project_id")
+    if project_id:
+        from services.membership_service import is_project_manager
+        try:
+            proj_oid = project_id if isinstance(project_id, ObjectId) else ObjectId(str(project_id))
+        except Exception:
+            return False
+        if await is_project_manager(core_db, user_oid, proj_oid):
             return True
     
     return False
 
 
 async def can_start_p2p_chat(user1_id: str, user2_id: str, core_db) -> bool:
-    """检查两个用户是否可以开始1v1聊天"""
+    """Same project membership (via active shell project of user1)."""
     user1 = await core_db.users.find_one({"_id": ObjectId(user1_id)})
     user2 = await core_db.users.find_one({"_id": ObjectId(user2_id)})
     
     if not user1 or not user2:
         return False
-    
-    # 同项目才能1v1
-    if str(user1.get("project_id")) == str(user2.get("project_id")):
-        return True
-    
-    # Manager可以主动联系项目内任何人
-    if user1.get("role") == "manager":
-        if str(user1.get("project_id")) == str(user2.get("project_id")):
-            return True
-    
-    return False
+
+    pid = user1.get("project_id")
+    if not pid:
+        return False
+
+    from services.membership_service import get_membership
+    m1 = await get_membership(core_db, user1["_id"], pid)
+    m2 = await get_membership(core_db, user2["_id"], pid)
+    return m1 is not None and m2 is not None
 
 
 # ============== REST API Endpoints ==============
@@ -229,20 +232,24 @@ async def get_chat_members(
         if not project_id:
             return {"success": True, "members": []}
     
-    # 查询项目成员
-    members = await core_db.users.find({
-        "project_id": ObjectId(project_id)
-    }).to_list(100)
+    from services.membership_service import list_project_member_users
+    try:
+        project_oid = ObjectId(project_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid project ID")
+
+    members = await list_project_member_users(core_db, project_oid)
     
     result = []
     for member in members:
-        member_id = str(member["_id"])
+        member_id = member["id"]
         
         # 检查实时在线状态
         is_online = connection_manager.is_online(member_id)
         
         # 脱敏逻辑：如果设置为隐身，显示为离线
-        online_state = member.get("online_state", "offline")
+        user_doc = await core_db.users.find_one({"_id": ObjectId(member_id)})
+        online_state = (user_doc or {}).get("online_state", "offline")
         if online_state == "invisible":
             display_state = "offline"
         elif is_online:
@@ -255,9 +262,11 @@ async def get_chat_members(
             "name": member.get("name"),
             "email": member.get("email"),
             "role": member.get("role"),
+            "roles": member.get("roles", []),
             "avatar_url": member.get("avatar_url"),
             "online_state": display_state,
-            "last_seen": member.get("last_seen").isoformat() if member.get("last_seen") else None
+            "last_seen": (user_doc or {}).get("last_seen").isoformat()
+                if user_doc and user_doc.get("last_seen") else None
         })
     
     return {

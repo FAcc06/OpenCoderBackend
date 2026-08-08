@@ -89,6 +89,35 @@ async def apply_to_project(
             status_code=409,
             detail="You have already applied to this project"
         )
+
+    # 6b. Membership checks
+    from services.membership_service import (
+        ensure_under_limit,
+        get_membership,
+        bootstrap_legacy_memberships,
+        normalize_roles,
+    )
+    await bootstrap_legacy_memberships(core_db, applicant_user_id)
+
+    existing_membership = await get_membership(core_db, applicant_user_id, project_oid)
+    existing_roles = normalize_roles(existing_membership)
+
+    # Already a coder (possibly also manager) — nothing to apply for
+    if "coder" in existing_roles:
+        raise HTTPException(
+            status_code=409,
+            detail="You already have coder access on this project. Open it from Hub.",
+        )
+
+    # Owner already gets manager+coder on create; tell them to use Hub
+    if str(project.get("owner_user_id")) == str(applicant_user_id):
+        raise HTTPException(
+            status_code=400,
+            detail="You own this project. Use Hub → Enter as Coder (owners have both roles).",
+        )
+
+    if not existing_membership:
+        await ensure_under_limit(core_db, applicant_user_id)
     
     # 7. 创建申请（使用 token 中的真实用户ID，存储项目、Manager 和申请人信息）
     application = Application(
@@ -153,35 +182,65 @@ async def get_my_applications(
 async def get_project_applications(
     project_id: str,
     page: int = 1,
-    limit: int = 10
+    limit: int = 50,
+    status: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    search: Optional[str] = None,
 ):
     """获取项目申请列表 - 无需认证"""
+    from datetime import datetime as dt
     core_db = get_core_db()
-    
+
     try:
         project_oid = ObjectId(project_id)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid project ID")
-    
-    # 检查项目是否存在
+
     project = await core_db.projects.find_one({"_id": project_oid})
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    
-    # 获取申请列表
-    query = core_db.applications.find({"project_id": project_oid})
-    total = await core_db.applications.count_documents({"project_id": project_oid})
-    
-    # 分页
+
+    query: dict = {"project_id": project_oid}
+
+    if status and status != "all":
+        query["status"] = status
+    if date_from or date_to:
+        date_filter: dict = {}
+        if date_from:
+            try:
+                date_filter["$gte"] = dt.fromisoformat(date_from)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid date_from format (use YYYY-MM-DD)")
+        if date_to:
+            try:
+                date_filter["$lte"] = dt.fromisoformat(date_to).replace(hour=23, minute=59, second=59)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid date_to format (use YYYY-MM-DD)")
+        query["created_at"] = date_filter
+    if search:
+        # applicant_name and applicant_email are stored directly on the document
+        query["$or"] = [
+            {"applicant_name":  {"$regex": search, "$options": "i"}},
+            {"applicant_email": {"$regex": search, "$options": "i"}},
+        ]
+
+    total = await core_db.applications.count_documents(query)
     skip = (page - 1) * limit
-    applications = await query.skip(skip).limit(limit).to_list(length=None)
-    
+    applications = await (
+        core_db.applications.find(query)
+        .sort("created_at", -1)
+        .skip(skip)
+        .limit(limit)
+        .to_list(length=None)
+    )
+
     return PaginatedResponse(
         items=[Application(**app) for app in applications],
         total=total,
         page=page,
         limit=limit,
-        pages=(total + limit - 1) // limit
+        pages=(total + limit - 1) // limit if limit > 0 else 1,
     )
 
 @router.post("/{project_id}/applications/{app_id}/approve")
@@ -225,6 +284,21 @@ async def approve_application(
             detail="Application missing applicant_user_id"
         )
     
+    from services.membership_service import (
+        ensure_under_limit,
+        upsert_membership,
+        get_membership,
+        bootstrap_legacy_memberships,
+        normalize_roles,
+    )
+
+    applicant_oid = ObjectId(applicant_user_id)
+    await bootstrap_legacy_memberships(core_db, applicant_oid)
+
+    existing = await get_membership(core_db, applicant_oid, project_oid)
+    if not existing:
+        await ensure_under_limit(core_db, applicant_oid)
+
     # ⭐ 1. 更新申请状态
     await core_db.applications.update_one(
         {"_id": app_oid},
@@ -235,27 +309,44 @@ async def approve_application(
             }
         }
     )
-    
-    # ⭐ 2. 更新 Coder 的 project_id（关联到项目）
-    update_result = await core_db.users.update_one(
-        {"_id": ObjectId(applicant_user_id)},
-        {
-            "$set": {
-                "project_id": project_oid,
-                "updated_at": datetime.utcnow()
-            }
-        }
+
+    # ⭐ 2. ADD coder into roles[] (keeps manager if already present)
+    membership = await upsert_membership(
+        core_db,
+        user_id=applicant_oid,
+        project_id=project_oid,
+        role="coder",
     )
-    
-    if update_result.matched_count == 0:
-        # 用户不存在，但申请已批准，记录警告
+    roles = normalize_roles(membership)
+
+    # ⭐ 3. Only set active project if user has none yet
+    user_doc = await core_db.users.find_one({"_id": applicant_oid})
+    user_updated = False
+    if user_doc:
+        if not user_doc.get("project_id"):
+            await core_db.users.update_one(
+                {"_id": applicant_oid},
+                {"$set": {
+                    "project_id": project_oid,
+                    "role": "coder",
+                    "updated_at": datetime.utcnow(),
+                }},
+            )
+        else:
+            await core_db.users.update_one(
+                {"_id": applicant_oid},
+                {"$set": {"updated_at": datetime.utcnow()}},
+            )
+        user_updated = True
+    else:
         print(f"Warning: User {applicant_user_id} not found when approving application")
-    
+
     return {
         "message": "Application approved successfully",
-        "user_updated": update_result.matched_count > 0,
+        "user_updated": user_updated,
+        "membership_roles": roles,
         "applicant_user_id": str(applicant_user_id),
-        "project_id": str(project_oid)
+        "project_id": str(project_oid),
     }
 
 @router.post("/{project_id}/applications/{app_id}/reject")

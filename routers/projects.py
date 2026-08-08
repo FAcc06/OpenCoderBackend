@@ -52,14 +52,17 @@ async def create_project(token: str, project_data: ProjectCreate):
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     
-    # 检查用户是否已经有项目
-    user = await core_db.users.find_one({"email": user_email})
-    if user and user.get("project_id"):
-        raise HTTPException(
-            status_code=400,
-            detail="User already has a project. Each user can only own one project."
-        )
-    
+    from services.membership_service import (
+        ensure_under_limit,
+        upsert_membership,
+        bootstrap_legacy_memberships,
+    )
+
+    user_oid = ObjectId(user_id)
+    # Backfill legacy memberships so the 10-limit count is accurate
+    await bootstrap_legacy_memberships(core_db, user_oid)
+    await ensure_under_limit(core_db, user_oid)
+
     # 清理slug
     slug = sanitize_slug(project_data.slug)
     
@@ -78,7 +81,7 @@ async def create_project(token: str, project_data: ProjectCreate):
     project = Project(
         name=project_data.name,
         slug=slug,
-        owner_user_id=ObjectId(user_id),  # ✅ 使用真实用户ID
+        owner_user_id=user_oid,
         db_name=db_name,
         tags=project_data.tags,
         created_at=datetime.utcnow(),
@@ -87,13 +90,23 @@ async def create_project(token: str, project_data: ProjectCreate):
     
     result = await core_db.projects.insert_one(project.dict(by_alias=True))
     project.id = result.inserted_id
-    
-    # 更新用户的 project_id
+
+    # Owner gets both roles so Hub shows Manager + Coder enter buttons
+    await upsert_membership(
+        core_db,
+        user_id=user_oid,
+        project_id=project.id,
+        role="manager",
+        roles=["manager", "coder"],
+    )
+
+    # Set as active project so existing UI keeps working
     await core_db.users.update_one(
         {"email": user_email},
         {
             "$set": {
                 "project_id": project.id,
+                "role": "manager",
                 "updated_at": datetime.utcnow()
             }
         }

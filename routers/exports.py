@@ -20,22 +20,29 @@ logger = logging.getLogger(__name__)
 
 
 async def verify_manager(user: Dict[str, Any], project_id: str):
-    """验证用户是否为项目的 Manager"""
+    """验证用户是否为项目的 Manager（owner 或 membership manager）"""
     core_db = get_core_db()
     
     try:
         project_oid = ObjectId(project_id)
-    except:
+    except Exception:
         raise HTTPException(status_code=400, detail="Invalid project ID")
     
     project = await core_db.projects.find_one({"_id": project_oid})
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     
-    # 检查是否是项目的 owner
-    # JWT payload 中用户 ID 字段名是 "sub"
     user_id = user.get("sub") or user.get("id")
-    if str(project.get("owner_user_id")) != user_id:
+    if not user_id:
+        raise HTTPException(status_code=403, detail="Only project manager can export data")
+
+    from services.membership_service import is_project_manager
+    try:
+        user_oid = ObjectId(str(user_id))
+    except Exception:
+        raise HTTPException(status_code=403, detail="Only project manager can export data")
+
+    if not await is_project_manager(core_db, user_oid, project_oid):
         raise HTTPException(status_code=403, detail="Only project manager can export data")
     
     return project

@@ -14,7 +14,7 @@ async def create_assignments(
     project_id: str,
     assignment_data: AssignmentCreate
 ):
-    """批量创建分配 - 无需认证"""
+    """批量创建分配 — assignee must have coder membership on the project"""
     core_db = get_core_db()
     
     try:
@@ -26,6 +26,27 @@ async def create_assignments(
     project = await core_db.projects.find_one({"_id": project_oid})
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+
+    from services.membership_service import (
+        bootstrap_legacy_memberships,
+        user_has_membership_role,
+    )
+    coder_uid = assignment_data.coder_user_id
+    if not isinstance(coder_uid, ObjectId):
+        try:
+            coder_uid = ObjectId(str(coder_uid))
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid coder_user_id")
+
+    await bootstrap_legacy_memberships(core_db, coder_uid)
+    if not await user_has_membership_role(core_db, coder_uid, project_oid, "coder"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Assignee must have coder access on this project. "
+                "Managers with dual roles can be assigned; others must join as coder first."
+            ),
+        )
     
     # 获取项目数据库
     project_db = await get_project_db(project_id)

@@ -1,7 +1,9 @@
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Query
+from pydantic import BaseModel
 from typing import List, Optional
 from bson import ObjectId
 from datetime import datetime, timedelta
+import io
 import logging
 import json
 
@@ -17,6 +19,48 @@ from services.google_drive import GoogleDriveService
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# ── PDF text extraction ───────────────────────────────────────────────────────
+
+MAX_EXTRACT_CHARS = 80_000   # cap sent to LLM (pypdf may return more for long docs)
+
+def extract_pdf_text(file_bytes: bytes) -> str:
+    """
+    Extract plain text from PDF bytes.
+    Tries pypdf first, falls back to pdfminer.six for complex font encodings.
+    Returns empty string only if both fail.
+    """
+    # ── Try pypdf first (fast) ────────────────────────────────────────────────
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(file_bytes))
+        n_pages = len(reader.pages)
+        logger.info("pypdf: PDF has %d pages", n_pages)
+        parts = []
+        for i, page in enumerate(reader.pages):
+            try:
+                text = page.extract_text() or ""
+                parts.append(text)
+            except Exception as page_err:
+                logger.warning("pypdf: page %d error: %s", i, page_err)
+        combined = "\n".join(parts).strip()
+        logger.info("pypdf: extracted %d chars", len(combined))
+        if combined:
+            return combined
+        logger.info("pypdf returned empty — trying pdfminer.six fallback")
+    except Exception as e:
+        logger.warning("pypdf failed: %s — trying pdfminer.six fallback", e)
+
+    # ── Fallback: pdfminer.six (handles more font encodings) ─────────────────
+    try:
+        from pdfminer.high_level import extract_text as pdfminer_extract
+        combined = pdfminer_extract(io.BytesIO(file_bytes)).strip()
+        logger.info("pdfminer.six: extracted %d chars", len(combined))
+        return combined
+    except Exception as e:
+        logger.warning("pdfminer.six also failed: %s", e)
+        return ""
+
 
 @router.post("/{project_id}/pdf-coding/upload")
 async def upload_pdf_document(
@@ -76,6 +120,10 @@ async def upload_pdf_document(
         file_size = len(file_content)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to read file: {str(e)}")
+
+    # 提取文本（内存中完成，毫秒级，非阻塞）
+    extracted_text = extract_pdf_text(file_content)
+    logger.info("Extracted %d chars from PDF %s", len(extracted_text), pdf.filename)
     
     # 限制文件大小 (50MB)
     if file_size > 50 * 1024 * 1024:
@@ -225,6 +273,10 @@ async def upload_pdf_document(
             "file_size": file_size,
             "page_count": None,
             "uploaded_by": ObjectId(user_id),
+            # Store truncated extracted text for summary generation
+            "extracted_text": extracted_text[:MAX_EXTRACT_CHARS] if extracted_text else None,
+            "summary": None,
+            "summary_model": None,
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow()
         }
@@ -233,14 +285,15 @@ async def upload_pdf_document(
         document_id = pdf_result.inserted_id
         
         logger.info(f"Created PDF document record: {document_id}")
-        
+
         return {
             "success": True,
             "task_id": str(task_id),
             "document_id": str(document_id),
             "readable_task_id": readable_task_id,
             "pdf_url": drive_result["drive_file_url"],
-            "message": "PDF Document Coding task created successfully"
+            "message": "PDF Document Coding task created successfully",
+            "has_text": bool(extracted_text.strip()),
         }
         
     except Exception as e:
@@ -311,10 +364,17 @@ async def get_pdf_coding_task(
             "created_by": str(task.get("created_by"))
         },
         "document": {
-            **document,
             "_id": str(document["_id"]),
             "task_id": str(document["task_id"]),
-            "uploaded_by": str(document.get("uploaded_by"))
+            "file_name": document.get("file_name"),
+            "drive_file_id": document.get("drive_file_id"),
+            "drive_file_url": document.get("drive_file_url"),
+            "mime_type": document.get("mime_type", "application/pdf"),
+            "file_size": document.get("file_size"),
+            "page_count": document.get("page_count"),
+            "uploaded_by": str(document.get("uploaded_by")),
+            "summary": document.get("summary"),
+            "summary_model": document.get("summary_model"),
         },
         "document_coding": {
             **doc_coding,
@@ -619,3 +679,157 @@ async def update_document_page_count(
         )
     
     return {"success": True, "message": "Page count updated"}
+
+
+# ── Generate / refresh summary for an existing PDF document ──────────────────
+
+class PDFSummaryRequest(BaseModel):
+    """Optional body: supply custom_text to bypass pypdf extraction (e.g. scanned PDFs)."""
+    custom_text: Optional[str] = None
+
+
+@router.post("/{project_id}/pdf-coding/document/{document_id}/summary")
+async def generate_pdf_summary(
+    project_id: str,
+    document_id: str,
+    token: str = Query(...),
+    body: PDFSummaryRequest = PDFSummaryRequest(),
+):
+    """
+    Generate (or regenerate) an AI summary for a PDF document.
+
+    Text priority:
+      1. body.custom_text  — user-supplied text (e.g. for scanned PDFs)
+      2. doc.extracted_text — auto-extracted during upload
+      3. re-download from Drive + pypdf extraction (fallback for old docs)
+
+    If no text can be obtained at all, returns 422 with no_text=True so the
+    frontend can show a manual-text input instead of a generic error.
+    """
+    try:
+        verify_token(token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    try:
+        doc_oid = ObjectId(document_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid document ID")
+
+    project_db = await get_project_db(project_id)
+    doc = await project_db.pdf_documents.find_one({"_id": doc_oid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="PDF document not found")
+
+    # ── 1. User-supplied text takes priority ──────────────────────────────────
+    if body.custom_text and body.custom_text.strip():
+        text = body.custom_text.strip()[:MAX_EXTRACT_CHARS]
+        # Cache it so future calls don't need it again
+        await project_db.pdf_documents.update_one(
+            {"_id": doc_oid},
+            {"$set": {"extracted_text": text, "updated_at": datetime.utcnow()}},
+        )
+    else:
+        # ── 2. Already-stored extracted text ─────────────────────────────────
+        text = doc.get("extracted_text") or ""
+
+        # ── 3. Re-download from Drive and extract (old docs without stored text)
+        if not text.strip():
+            logger.info("No extracted_text for %s, re-downloading from Drive…", document_id)
+            core_db = get_core_db()
+
+            project_oid = ObjectId(project_id)
+            project = await core_db.projects.find_one({"_id": project_oid})
+            if not project:
+                raise HTTPException(status_code=404, detail="Project not found")
+
+            manager_id = project.get("owner_user_id")
+            manager = await core_db.users.find_one({"_id": manager_id}) if manager_id else None
+            google_creds = (manager or {}).get("google_credentials", {})
+            access_token = google_creds.get("access_token", "")
+            refresh_token = google_creds.get("refresh_token")
+            drive_file_id = doc.get("drive_file_id", "")
+
+            if not drive_file_id:
+                raise HTTPException(status_code=400, detail="Document has no Drive file ID")
+            if not access_token:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Manager's Google Drive credentials not available. Please re-authenticate.",
+                )
+
+            import tempfile, os
+            from services.transcription_service import download_drive_file
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                    tmp_path = tmp.name
+
+                await download_drive_file(drive_file_id, access_token, refresh_token, tmp_path)
+
+                with open(tmp_path, "rb") as f:
+                    raw_bytes = f.read()
+
+                logger.info("Downloaded %d bytes for doc %s (first 4: %s)",
+                            len(raw_bytes), document_id, raw_bytes[:4])
+
+                if not raw_bytes.startswith(b"%PDF"):
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Downloaded file does not look like a PDF (got {raw_bytes[:20]}). "
+                               "The Drive link may have expired or returned an error page.",
+                    )
+
+                text = extract_pdf_text(raw_bytes)[:MAX_EXTRACT_CHARS]
+                logger.info("Extracted %d chars from re-downloaded PDF for doc %s", len(text), document_id)
+
+                if text.strip():
+                    await project_db.pdf_documents.update_one(
+                        {"_id": doc_oid},
+                        {"$set": {"extracted_text": text, "updated_at": datetime.utcnow()}},
+                    )
+                else:
+                    logger.warning("pypdf returned empty text for doc %s despite valid PDF bytes", document_id)
+
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.exception("Drive re-download failed for doc %s", document_id)
+                raise HTTPException(status_code=500, detail=f"Failed to download PDF from Drive: {e}")
+            finally:
+                if tmp_path:
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
+
+        # ── No text at all ────────────────────────────────────────────────────
+        if not text.strip():
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "no_text": True,
+                    "message": (
+                        "pypdf could not extract any text from this PDF even though it is a valid PDF file. "
+                        "This can happen with certain font encodings or copy-protected PDFs. "
+                        "Please paste the document text manually below."
+                    ),
+                },
+            )
+
+    from services.transcription_service import generate_summary, SUMMARY_MODEL
+    try:
+        summary_text = await generate_summary(text)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM summary failed: {e}")
+
+    await project_db.pdf_documents.update_one(
+        {"_id": doc_oid},
+        {"$set": {
+            "summary":       summary_text,
+            "summary_model": SUMMARY_MODEL,
+            "updated_at":    datetime.utcnow(),
+        }},
+    )
+
+    return {"success": True, "summary": summary_text, "summary_model": SUMMARY_MODEL}

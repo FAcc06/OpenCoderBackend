@@ -1,3 +1,4 @@
+import asyncio
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -8,7 +9,8 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 from database import connect_to_mongo, close_mongo_connection
-from routers import users, projects, applications, tasks, assignments, annotations, tag_groups, board, public, dashboard, auth, llm, notifications, chat, test_drive, exports, consensus, proxy, pdf_coding
+from routers import users, projects, applications, tasks, assignments, annotations, tag_groups, board, public, dashboard, auth, llm, notifications, chat, test_drive, exports, consensus, proxy, pdf_coding, transcription
+from services.transcription_service import transcription_worker_loop
 
 # 加载环境变量
 load_dotenv()
@@ -17,8 +19,15 @@ load_dotenv()
 async def lifespan(app: FastAPI):
     # 启动时连接数据库
     await connect_to_mongo()
+    # 启动转录 worker（同进程异步任务）
+    worker_task = asyncio.create_task(transcription_worker_loop())
     yield
-    # 关闭时断开数据库连接
+    # 关闭时停止 worker 并断开数据库
+    worker_task.cancel()
+    try:
+        await worker_task
+    except asyncio.CancelledError:
+        pass
     await close_mongo_connection()
 
 app = FastAPI(
@@ -98,6 +107,7 @@ app.include_router(chat.router, tags=["chat"])
 app.include_router(test_drive.router, tags=["test-drive"])
 app.include_router(proxy.router, prefix="/api", tags=["proxy"])
 app.include_router(pdf_coding.router, prefix="/api/projects", tags=["pdf-coding"])
+app.include_router(transcription.router, prefix="/api/projects", tags=["transcription"])
 
 @app.get("/")
 async def root():

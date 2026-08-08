@@ -265,6 +265,26 @@ async def get_project_coders(project_id: str):
     ]
     
     coders_stats = await project_db.annotations.aggregate(pipeline).to_list(None)
+    stats_by_id = {c["coder_id"]: c for c in coders_stats}
+
+    # Union membership coders (incl. dual-role managers with zero annotations)
+    if project_id != "test_dashboard":
+        from services.membership_service import list_project_member_users
+        members = await list_project_member_users(
+            core_db, project_oid, require_role="coder"
+        )
+        for m in members:
+            cid = m["id"]
+            if cid not in stats_by_id:
+                stats_by_id[cid] = {
+                    "coder_id": cid,
+                    "total_annotations": 0,
+                    "unique_tasks_count": 0,
+                    "last_annotation": None,
+                    "first_annotation": None,
+                }
+
+    coders_stats = list(stats_by_id.values())
     
     # 从 assignments 获取分配信息
     for coder in coders_stats:
@@ -294,6 +314,8 @@ async def get_project_coders(project_id: str):
             coder["name"] = f"Coder {coder['coder_id'][:8]}"
             coder["email"] = ""
             coder["avatar_url"] = None
+
+    coders_stats.sort(key=lambda c: c.get("total_annotations", 0), reverse=True)
     
     return {
         "project_id": project_id,
