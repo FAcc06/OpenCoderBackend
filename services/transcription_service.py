@@ -398,6 +398,7 @@ async def process_transcription_job(job: dict, core_db, get_project_db_fn) -> No
         transcript_id = result.inserted_id
 
         # 8. Generate summary (non-fatal — transcription still succeeds if this fails)
+        summary_text = None
         try:
             logger.info("Generating summary for transcript %s", transcript_id)
             summary_text = await generate_summary(normalized["text"])
@@ -425,7 +426,7 @@ async def process_transcription_job(job: dict, core_db, get_project_db_fn) -> No
             },
         )
 
-        # 9. Mark job done
+        # 10. Mark job done
         await core_db.transcription_jobs.update_one(
             {"_id": job_id},
             {
@@ -447,6 +448,68 @@ async def process_transcription_job(job: dict, core_db, get_project_db_fn) -> No
             job_id, transcript_id, version,
             len(normalized["segments"]), len(normalized["words"]),
         )
+
+        # 11. System timeline events (transcription + optional summary)
+        try:
+            from services.activity_log_service import log_system_activity
+
+            project_oid = ObjectId(project_id)
+            task_title = task.get("title") or filename
+            text = normalized.get("text") or ""
+            char_count = len(text)
+            word_count = len(normalized.get("words") or [])
+            if word_count == 0 and text.strip():
+                word_count = len(text.split())
+            segment_count = len(normalized.get("segments") or [])
+            duration = normalized.get("duration_seconds")
+            requested_by = str(created_by) if created_by else None
+
+            await log_system_activity(
+                core_db,
+                "transcription.completed",
+                f"Completed transcription for {task_title}",
+                project_id=project_oid,
+                resource_type="task",
+                resource_id=str(task_oid),
+                event_type="transcription.completed",
+                payload={
+                    "taskId": str(task_oid),
+                    "taskTitle": task_title,
+                    "transcriptId": str(transcript_id),
+                    "version": version,
+                    "model": WHISPER_MODEL,
+                    "language": normalized.get("language"),
+                    "durationSeconds": duration,
+                    "charCount": char_count,
+                    "wordCount": word_count,
+                    "segmentCount": segment_count,
+                    "filename": filename,
+                    "requestedBy": requested_by,
+                },
+            )
+
+            if summary_text:
+                await log_system_activity(
+                    core_db,
+                    "transcription.summarized",
+                    f"Generated summary for {task_title}",
+                    project_id=project_oid,
+                    resource_type="task",
+                    resource_id=str(task_oid),
+                    event_type="transcription.summarized",
+                    payload={
+                        "taskId": str(task_oid),
+                        "taskTitle": task_title,
+                        "transcriptId": str(transcript_id),
+                        "model": SUMMARY_MODEL,
+                        "summaryCharCount": len(summary_text),
+                        "sourceCharCount": char_count,
+                        "preview": summary_text[:280],
+                        "requestedBy": requested_by,
+                    },
+                )
+        except Exception as log_err:
+            logger.warning("Failed to write transcription activity logs: %s", log_err)
 
     except Exception as exc:
         logger.exception("Unexpected error in job %s: %s", job_id, exc)

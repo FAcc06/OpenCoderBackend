@@ -275,6 +275,21 @@ async def set_active_project(
         },
     )
 
+    try:
+        from services.activity_log_service import log_user_activity
+        await log_user_activity(
+            core_db,
+            user_oid,
+            "project.enter",
+            f"Entered project as {role}",
+            project_id=project_oid,
+            resource_type="project",
+            resource_id=str(project_oid),
+            meta={"as_role": role, "roles": roles},
+        )
+    except Exception:
+        pass
+
     return {
         "success": True,
         "project_id": str(project_oid),

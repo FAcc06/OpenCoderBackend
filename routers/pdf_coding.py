@@ -334,8 +334,17 @@ async def get_pdf_coding_task(
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     
-    if task.get("task_type") != TaskType.PDF_DOCUMENT_CODING:
+    allowed_types = {
+        TaskType.PDF_DOCUMENT_CODING,
+        TaskType.PDF_DOCUMENT_CODING.value,
+        TaskType.MULTIMODAL,
+        TaskType.MULTIMODAL.value,
+    }
+    if task.get("task_type") not in allowed_types:
         raise HTTPException(status_code=400, detail="Not a PDF coding task")
+    if task.get("task_type") in (TaskType.MULTIMODAL, TaskType.MULTIMODAL.value):
+        if not (task.get("payload") or {}).get("pdf"):
+            raise HTTPException(status_code=400, detail="Multimodal task has no PDF payload")
     
     # 获取 PDF Document
     document = await project_db.pdf_documents.find_one({"task_id": task_oid})

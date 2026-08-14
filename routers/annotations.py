@@ -89,10 +89,11 @@ async def upsert_task_note(
 
 
 @router.get("/{project_id}/notes")
-async def list_my_notes(
+async def list_notes(
     project_id: str,
     token: str = Query(...),
     task_type: Optional[str] = None,
+    coder_id: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     sort: str = "newest",
@@ -100,25 +101,48 @@ async def list_my_notes(
     page: int = 1,
     limit: int = 50,
 ):
-    """Return notes written by the current coder with optional filtering and pagination."""
+    """
+    List reflexive task memos.
+    - Coders: only their own notes.
+    - Project managers: all notes in the project (optional coder_id filter).
+    task_type supports a single value or comma-separated list.
+    """
     from jose import jwt
     from datetime import datetime as dt
     import os
+    from services.membership_service import is_project_manager
+
     SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
     ALGORITHM  = os.getenv("ALGORITHM", "HS256")
     try:
         payload  = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        coder_id = ObjectId(payload["sub"])
+        user_oid = ObjectId(payload["sub"])
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid token")
+
+    try:
+        project_oid = ObjectId(project_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid project_id")
+
+    core_db = get_core_db()
+    is_manager = await is_project_manager(core_db, user_oid, project_oid)
 
     project_db = await get_project_db(project_id)
 
     # ── Build notes query ────────────────────────────────────────────────────
     notes_query: dict = {
-        "coder_user_id": coder_id,
         "content": {"$nin": ["", None]},
     }
+    if is_manager:
+        if coder_id:
+            try:
+                notes_query["coder_user_id"] = ObjectId(coder_id)
+            except Exception:
+                raise HTTPException(status_code=400, detail="Invalid coder_id")
+    else:
+        notes_query["coder_user_id"] = user_oid
+
     if date_from or date_to:
         date_filter: dict = {}
         if date_from:
@@ -141,14 +165,29 @@ async def list_my_notes(
     )
 
     # ── Batch-fetch task info ─────────────────────────────────────────────────
-    task_ids = list({n["task_id"] for n in all_notes})
+    task_ids = list({n["task_id"] for n in all_notes if n.get("task_id")})
     task_query: dict = {"_id": {"$in": task_ids}}
+    type_list = []
     if task_type and task_type != "all":
-        task_query["task_type"] = task_type
+        type_list = [t.strip() for t in task_type.split(",") if t.strip() and t.strip() != "all"]
+        if len(type_list) == 1:
+            task_query["task_type"] = type_list[0]
+        elif len(type_list) > 1:
+            task_query["task_type"] = {"$in": type_list}
     tasks_map = {
         t["_id"]: t
         async for t in project_db.tasks.find(task_query, {"title": 1, "task_type": 1})
     }
+
+    # ── Batch-fetch coder profiles (managers need names) ──────────────────────
+    coder_ids = list({n["coder_user_id"] for n in all_notes if n.get("coder_user_id")})
+    users_map: dict = {}
+    if coder_ids:
+        async for u in core_db.users.find(
+            {"_id": {"$in": coder_ids}},
+            {"name": 1, "email": 1},
+        ):
+            users_map[u["_id"]] = u
 
     # ── Build result, applying task_type + text search filters ───────────────
     result = []
@@ -156,14 +195,20 @@ async def list_my_notes(
         t = tasks_map.get(n["task_id"])
         if t is None:
             # task_type filter excluded this task
-            if task_type and task_type != "all":
+            if type_list:
                 continue
             t = {}
         content    = n.get("content", "")
         task_title = t.get("title", "Untitled")
+        coder = users_map.get(n.get("coder_user_id")) or {}
+        coder_name = coder.get("name") or "Unknown"
         if search:
             q = search.lower()
-            if q not in task_title.lower() and q not in content.lower():
+            if (
+                q not in task_title.lower()
+                and q not in content.lower()
+                and q not in coder_name.lower()
+            ):
                 continue
         result.append({
             "note_id":    str(n["_id"]),
@@ -172,6 +217,9 @@ async def list_my_notes(
             "task_type":  t.get("task_type", ""),
             "content":    content,
             "updated_at": n["updated_at"].isoformat() if n.get("updated_at") else None,
+            "coder_user_id": str(n["coder_user_id"]) if n.get("coder_user_id") else None,
+            "coder_name": coder_name,
+            "coder_email": coder.get("email"),
         })
 
     total = len(result)
@@ -185,6 +233,7 @@ async def list_my_notes(
         "page":   page,
         "limit":  limit,
         "pages":  max(1, -(-total // limit)) if limit > 0 else 1,
+        "scope":  "project" if is_manager else "mine",
     }
 
 @router.post("/{project_id}/annotations", response_model=Annotation)
@@ -477,6 +526,28 @@ async def submit_annotation_and_get_next(
             print(f"⚠️  Failed to send auto-notification: {e}")
             # 不影响主流程，继续
     
+    try:
+        from services.activity_log_service import log_user_activity
+        await log_user_activity(
+            core_db,
+            coder_user_id,
+            "annotation.submit",
+            f"Submitted annotation for task: {task.get('title') or task_oid}",
+            project_id=project_oid,
+            event_type="coding.activity",
+            resource_type="annotation",
+            resource_id=str(annotation.id),
+            role="coder",
+            payload={
+                "task_id": str(task_oid),
+                "task_title": task.get("title"),
+                "task_type": task.get("task_type"),
+                "label_count": len(annotation_data.labels or []),
+            },
+        )
+    except Exception:
+        pass
+
     # 12. 返回结果
     from models import Assignment
     return {

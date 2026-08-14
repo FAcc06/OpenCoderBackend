@@ -435,6 +435,43 @@ async def resolve_consensus(
     }
     
     result = await project_db.annotations.insert_one(consensus_annotation)
+
+    try:
+        from services.activity_log_service import log_user_activity
+        project_oid = ObjectId(project_id) if ObjectId.is_valid(project_id) else None
+        coder_actors = []
+        for cid in coder_ids:
+            if not ObjectId.is_valid(cid):
+                continue
+            u = await core_db.users.find_one({"_id": ObjectId(cid)}, {"name": 1, "email": 1, "avatar_url": 1})
+            coder_actors.append({
+                "id": cid,
+                "name": (u or {}).get("name") or "Coder",
+                "email": (u or {}).get("email"),
+                "avatarUrl": (u or {}).get("avatar_url"),
+                "role": "coder",
+            })
+        resolution = consensus_data.get("note") or consensus_data.get("labels") or "Consensus resolved"
+        if project_oid and ObjectId.is_valid(user_id):
+            await log_user_activity(
+                core_db,
+                ObjectId(user_id),
+                "icr.resolved",
+                f"Resolved ICR on {task.get('title') or task_id}",
+                project_id=project_oid,
+                event_type="icr.resolved",
+                resource_type="task",
+                resource_id=str(task_id),
+                payload={
+                    "taskId": str(task_id),
+                    "taskTitle": task.get("title"),
+                    "resolution": resolution if isinstance(resolution, str) else str(resolution),
+                    "coders": coder_actors,
+                    "consensus_id": str(result.inserted_id),
+                },
+            )
+    except Exception:
+        pass
     
     return {
         "success": True,

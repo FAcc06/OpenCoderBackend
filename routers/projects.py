@@ -78,12 +78,14 @@ async def create_project(token: str, project_data: ProjectCreate):
     db_name = generate_db_name(slug)
     
     # 创建项目（使用真实的用户ID作为所有者）
+    memo = (project_data.memo or "").strip() or None
     project = Project(
         name=project_data.name,
         slug=slug,
         owner_user_id=user_oid,
         db_name=db_name,
         tags=project_data.tags,
+        memo=memo,
         created_at=datetime.utcnow(),
         updated_at=datetime.utcnow()
     )
@@ -111,6 +113,30 @@ async def create_project(token: str, project_data: ProjectCreate):
             }
         }
     )
+
+    try:
+        from services.activity_log_service import log_user_activity
+        payload = {
+            "projectName": project_data.name,
+            "project_name": project_data.name,
+            "slug": slug,
+        }
+        if memo:
+            payload["memo"] = memo
+        await log_user_activity(
+            core_db,
+            user_oid,
+            "project.created",
+            f"Created project {project_data.name}",
+            project_id=project.id,
+            event_type="project.created",
+            resource_type="project",
+            resource_id=str(project.id),
+            role="project-manager",
+            payload=payload,
+        )
+    except Exception:
+        pass
     
     return project
 
