@@ -114,11 +114,14 @@ class Project(BaseModelWithTimestamp):
     cluster_uri: Optional[str] = None
     status: ProjectStatus = ProjectStatus.ACTIVE
     tags: List[str] = []
+    # Project-level memo / purpose note (shown on Timeline at creation)
+    memo: Optional[str] = None
 
 class ProjectCreate(BaseModel):
     name: str
     slug: str
     tags: List[str] = []
+    memo: Optional[str] = None
 
 # Per-project membership (source of truth for Hub)
 class ProjectMembership(BaseModelWithTimestamp):
@@ -248,19 +251,19 @@ class FinalizeMediaUploadRequest(BaseModel):
     mime_type: Optional[str] = None
 
 class MultimodalMediaItem(BaseModel):
-    """One Drive file slot for a multimodal task (image | video | audio)."""
+    """One Drive file slot for a multimodal task (image | video | audio | pdf)."""
     drive_file_id: str
-    media_type: str  # image | video | audio
+    media_type: str  # image | video | audio | pdf
     original_filename: Optional[str] = None
     file_size: Optional[int] = None
     mime_type: Optional[str] = None
 
 class FinalizeMultimodalUploadRequest(BaseModel):
-    """Create one task with multiple media payload slots filled."""
+    """Create one task with multiple media payload slots filled (+ optional text)."""
     title: str
-    items: List[MultimodalMediaItem]
+    items: List[MultimodalMediaItem] = []
     tags: List[str] = []
-    text: Optional[str] = None  # optional accompanying text
+    text: Optional[str] = None  # typed text and/or contents of dropped .txt files
 
 class TaskBulkCreate(BaseModel):
     tasks: List[TaskCreate]
@@ -323,6 +326,7 @@ class TagOption(BaseModel):
     label: str
     order: int
     active: bool = True
+    description: Optional[str] = None  # optional; useful as AI annotation hint
 
 class TagGroupConstraints(BaseModel):
     mutex_with_groups: List[str] = []

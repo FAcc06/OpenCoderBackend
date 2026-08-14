@@ -135,6 +135,23 @@ async def apply_to_project(
     
     result = await core_db.applications.insert_one(application.dict(by_alias=True))
     application.id = result.inserted_id
+
+    try:
+        from services.activity_log_service import log_user_activity
+        await log_user_activity(
+            core_db,
+            applicant_user_id,
+            "member.applied",
+            "Applied to join the project",
+            project_id=project_oid,
+            event_type="member.applied",
+            resource_type="application",
+            resource_id=str(application.id),
+            role="coder",
+            payload={"message": application_data.message},
+        )
+    except Exception:
+        pass
     
     return application
 
@@ -246,9 +263,10 @@ async def get_project_applications(
 @router.post("/{project_id}/applications/{app_id}/approve")
 async def approve_application(
     project_id: str,
-    app_id: str
+    app_id: str,
+    token: Optional[str] = None,
 ):
-    """批准申请 - 无需认证"""
+    """批准申请 — optional token attributes the log to the acting manager"""
     core_db = get_core_db()
     
     try:
@@ -341,6 +359,31 @@ async def approve_application(
     else:
         print(f"Warning: User {applicant_user_id} not found when approving application")
 
+    try:
+        from services.activity_log_service import log_user_activity, try_user_id_from_token
+        actor_id = try_user_id_from_token(token) or project.get("owner_user_id")
+        if actor_id:
+            await log_user_activity(
+                core_db,
+                actor_id if isinstance(actor_id, ObjectId) else ObjectId(str(actor_id)),
+                "member.approved",
+                f"Approved coder application for {application.get('applicant_name') or applicant_oid}",
+                project_id=project_oid,
+                event_type="member.approved",
+                resource_type="application",
+                resource_id=str(app_oid),
+                role="project-manager",
+                payload={
+                    "applicant_user_id": str(applicant_oid),
+                    "applicant_name": application.get("applicant_name"),
+                    "applicant_email": application.get("applicant_email"),
+                    "membership_roles": roles,
+                    "asRole": "coder",
+                },
+            )
+    except Exception:
+        pass
+
     return {
         "message": "Application approved successfully",
         "user_updated": user_updated,
@@ -352,9 +395,10 @@ async def approve_application(
 @router.post("/{project_id}/applications/{app_id}/reject")
 async def reject_application(
     project_id: str,
-    app_id: str
+    app_id: str,
+    token: Optional[str] = None,
 ):
-    """拒绝申请 - 无需认证"""
+    """拒绝申请 — optional token attributes the log to the acting manager"""
     core_db = get_core_db()
     
     try:
@@ -392,5 +436,28 @@ async def reject_application(
             }
         }
     )
+
+    try:
+        from services.activity_log_service import log_user_activity, try_user_id_from_token
+        actor_id = try_user_id_from_token(token) or project.get("owner_user_id")
+        if actor_id:
+            await log_user_activity(
+                core_db,
+                actor_id if isinstance(actor_id, ObjectId) else ObjectId(str(actor_id)),
+                "member.rejected",
+                f"Rejected application from {application.get('applicant_name') or application.get('applicant_user_id')}",
+                project_id=project_oid,
+                event_type="member.rejected",
+                resource_type="application",
+                resource_id=str(app_oid),
+                role="project-manager",
+                payload={
+                    "applicant_user_id": str(application.get("applicant_user_id")),
+                    "applicant_name": application.get("applicant_name"),
+                    "applicant_email": application.get("applicant_email"),
+                },
+            )
+    except Exception:
+        pass
     
     return {"message": "Application rejected successfully"}

@@ -636,6 +636,27 @@ Total Coders: {len(coder_stats)}
         
         zip_buffer.seek(0)
         filename = f"project_export_{project_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+        try:
+            from services.activity_log_service import log_user_activity
+            uid = user.get("sub") or user.get("id")
+            if uid and ObjectId.is_valid(str(uid)):
+                await log_user_activity(
+                    core_db,
+                    ObjectId(str(uid)),
+                    "export.completed",
+                    f"Exported project package ({filename})",
+                    project_id=project_oid,
+                    event_type="export.completed",
+                    resource_type="export",
+                    role="project-manager",
+                    payload={
+                        "exportKind": "complete-zip",
+                        "fileName": filename,
+                        "format": "zip",
+                    },
+                )
+        except Exception:
+            pass
         return StreamingResponse(
             zip_buffer,
             media_type="application/zip",
@@ -679,6 +700,27 @@ Total Coders: {len(coder_stats)}
         excel_buffer.seek(0)
         
         filename = f"project_complete_export_{project_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        try:
+            from services.activity_log_service import log_user_activity
+            uid = user.get("sub") or user.get("id")
+            if uid and ObjectId.is_valid(str(uid)):
+                await log_user_activity(
+                    core_db,
+                    ObjectId(str(uid)),
+                    "export.completed",
+                    f"Exported project package ({filename})",
+                    project_id=project_oid,
+                    event_type="export.completed",
+                    resource_type="export",
+                    role="project-manager",
+                    payload={
+                        "exportKind": "complete-excel",
+                        "fileName": filename,
+                        "format": "excel",
+                    },
+                )
+        except Exception:
+            pass
         return StreamingResponse(
             excel_buffer,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

@@ -12,7 +12,8 @@ router = APIRouter()
 @router.post("/{project_id}/assignments", response_model=List[Assignment])
 async def create_assignments(
     project_id: str,
-    assignment_data: AssignmentCreate
+    assignment_data: AssignmentCreate,
+    token: Optional[str] = None,
 ):
     """批量创建分配 — assignee must have coder membership on the project"""
     core_db = get_core_db()
@@ -70,7 +71,43 @@ async def create_assignments(
         # 更新分配ID
         for i, assignment in enumerate(assignments):
             assignment.id = result.inserted_ids[i]
-        
+
+        try:
+            from services.activity_log_service import log_user_activity, try_user_id_from_token
+            actor_id = try_user_id_from_token(token) or project.get("owner_user_id")
+            coder_user = await core_db.users.find_one({"_id": coder_uid})
+            task_oids = []
+            for t in assignment_data.task_ids:
+                try:
+                    task_oids.append(ObjectId(str(t)))
+                except Exception:
+                    pass
+            task_docs = []
+            if task_oids:
+                task_docs = await project_db.tasks.find({"_id": {"$in": task_oids}}).to_list(length=None)
+            titles = [t.get("title") or str(t.get("_id")) for t in task_docs]
+            if actor_id:
+                await log_user_activity(
+                    core_db,
+                    actor_id if isinstance(actor_id, ObjectId) else ObjectId(str(actor_id)),
+                    "member.assigned",
+                    f"Assigned {len(assignments)} task(s) to coder",
+                    project_id=project_oid,
+                    event_type="member.assigned",
+                    resource_type="assignment",
+                    role="project-manager",
+                    payload={
+                        "coder_user_id": str(coder_uid),
+                        "coder_name": (coder_user or {}).get("name"),
+                        "task_count": len(assignments),
+                        "taskCount": len(assignments),
+                        "task_ids": [str(t) for t in assignment_data.task_ids],
+                        "taskTitles": titles,
+                    },
+                )
+        except Exception:
+            pass
+
         return assignments
     except Exception as e:
         # 处理重复分配错误

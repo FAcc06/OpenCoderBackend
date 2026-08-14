@@ -23,13 +23,17 @@ MEDIA_SIZE_LIMITS = {
     "image": 10 * 1024 * 1024,
     "audio": 50 * 1024 * 1024,
     "video": 100 * 1024 * 1024,
+    "pdf": 50 * 1024 * 1024,
 }
 
+# MIME checks: prefix for media; exact set for pdf
 MEDIA_MIME_PREFIX = {
     "image": "image/",
     "audio": "audio/",
     "video": "video/",
 }
+
+MULTIMODAL_MEDIA_TYPES = frozenset({"image", "video", "audio", "pdf"})
 
 
 async def _resolve_manager_drive_context(
@@ -137,14 +141,22 @@ async def _ensure_project_folder(
 
 def _validate_media_meta(media_type: str, mime_type: str, file_size: int) -> None:
     if media_type not in MEDIA_SIZE_LIMITS:
-        raise HTTPException(status_code=400, detail="media_type must be image, video, or audio")
-
-    prefix = MEDIA_MIME_PREFIX[media_type]
-    if not mime_type or not mime_type.startswith(prefix):
         raise HTTPException(
             status_code=400,
-            detail=f"Only {media_type} files are allowed",
+            detail="media_type must be image, video, audio, or pdf",
         )
+
+    mime = (mime_type or "").lower().strip()
+    if media_type == "pdf":
+        if mime not in ("application/pdf", "application/x-pdf") and not mime.endswith("/pdf"):
+            raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+    else:
+        prefix = MEDIA_MIME_PREFIX[media_type]
+        if not mime or not mime.startswith(prefix):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Only {media_type} files are allowed",
+            )
 
     limit = MEDIA_SIZE_LIMITS[media_type]
     if file_size <= 0:
@@ -158,9 +170,10 @@ def _validate_media_meta(media_type: str, mime_type: str, file_size: int) -> Non
 @router.post("/{project_id}/tasks/bulk", response_model=List[Task])
 async def create_tasks_bulk(
     project_id: str,
-    tasks_data: TaskBulkCreate
+    tasks_data: TaskBulkCreate,
+    token: Optional[str] = Query(None),
 ):
-    """批量创建任务 - 无需认证，自动跳过重复文本的任务"""
+    """批量创建任务 — optional token attributes the activity log"""
     core_db = get_core_db()
     
     try:
@@ -213,6 +226,32 @@ async def create_tasks_bulk(
         existing = await project_db.tasks.find_one({"payload.text": task_dict["payload"]["text"]})
         if existing:
             inserted_tasks.append(Task(**existing))
+
+    try:
+        from services.activity_log_service import log_user_activity, try_user_id_from_token
+        actor_id = try_user_id_from_token(token) or project.get("owner_user_id")
+        if actor_id and inserted_tasks:
+            files = [
+                {
+                    "taskId": str(t.id),
+                    "title": t.title,
+                    "mediaType": getattr(t.task_type, "value", None) or str(t.task_type or "text"),
+                }
+                for t in inserted_tasks
+            ]
+            await log_user_activity(
+                core_db,
+                actor_id if isinstance(actor_id, ObjectId) else ObjectId(str(actor_id)),
+                "file.uploaded",
+                f"Uploaded {len(files)} task(s)",
+                project_id=project_oid,
+                event_type="file.uploaded",
+                resource_type="task",
+                role="project-manager",
+                payload={"count": len(files), "files": files},
+            )
+    except Exception:
+        pass
     
     return inserted_tasks
 
@@ -291,6 +330,71 @@ async def get_task_type_stats(project_id: str, token: str = Query(...)):
         "total": sum(stats.values())
     }
 
+def _task_type_match_clause(task_type: str) -> dict:
+    """
+    One modality/type → Mongo clause.
+    Modality filters also match multimodal tasks that contain that media.
+    """
+    if task_type == "image":
+        return {
+            "$or": [
+                {"task_type": "image"},
+                {"task_type": "multimodal", "payload.image.drive_file_id": {"$exists": True}},
+            ]
+        }
+    if task_type == "video":
+        return {
+            "$or": [
+                {"task_type": "video"},
+                {"task_type": "multimodal", "payload.video.drive_file_id": {"$exists": True}},
+            ]
+        }
+    if task_type == "audio":
+        return {
+            "$or": [
+                {"task_type": "audio"},
+                {"task_type": "multimodal", "payload.audio.drive_file_id": {"$exists": True}},
+            ]
+        }
+    if task_type in ("pdf", "pdf_document_coding"):
+        return {
+            "$or": [
+                {"task_type": "pdf_document_coding"},
+                {"task_type": "multimodal", "payload.pdf.drive_file_id": {"$exists": True}},
+            ]
+        }
+    if task_type == "text":
+        return {
+            "$or": [
+                {"task_type": "text"},
+                {"task_type": "multimodal", "payload.text": {"$type": "string", "$ne": ""}},
+            ]
+        }
+    return {"task_type": task_type}
+
+
+def _apply_task_type_filter(query: dict, task_type: Optional[str]) -> None:
+    """
+    Apply task_type filter. Supports a single value or comma-separated list
+    (e.g. "image,video,audio"). Empty / missing = no type filter.
+    """
+    if not task_type:
+        return
+    types = [t.strip() for t in task_type.split(",") if t.strip() and t.strip() != "all"]
+    if not types:
+        return
+    if len(types) == 1:
+        clause = _task_type_match_clause(types[0])
+        # Flatten single-key clause into query when possible
+        if set(clause.keys()) == {"$or"}:
+            query["$or"] = clause["$or"]
+        else:
+            query.update(clause)
+        return
+    # Multiple types: match any
+    query["$or"] = [_task_type_match_clause(t) for t in types]
+
+
 @router.get("/{project_id}/tasks", response_model=PaginatedResponse)
 async def get_tasks(
     project_id: str,
@@ -303,7 +407,7 @@ async def get_tasks(
     date_to: Optional[str] = None,
     search: Optional[str] = None,
 ):
-    """获取任务列表 - 无需认证"""
+    """获取任务列表 - 无需认证。task_type 支持逗号分隔多选。"""
     from datetime import datetime as dt
     core_db = get_core_db()
     
@@ -326,8 +430,7 @@ async def get_tasks(
         query["status"] = status
     if tags:
         query["tags"] = {"$in": tags.split(",")}
-    if task_type:
-        query["task_type"] = task_type
+    _apply_task_type_filter(query, task_type)
     if date_from or date_to:
         date_filter: dict = {}
         if date_from:
@@ -462,9 +565,10 @@ async def update_task(
 @router.delete("/{project_id}/tasks/{task_id}")
 async def delete_task(
     project_id: str,
-    task_id: str
+    task_id: str,
+    token: Optional[str] = Query(None),
 ):
-    """删除任务 - 无需认证"""
+    """删除任务 — optional token attributes the activity log"""
     core_db = get_core_db()
     
     try:
@@ -488,6 +592,30 @@ async def delete_task(
     
     # 删除任务
     await project_db.tasks.delete_one({"_id": task_oid})
+
+    try:
+        from services.activity_log_service import log_user_activity, try_user_id_from_token
+        actor_id = try_user_id_from_token(token) or project.get("owner_user_id") or task.get("created_by")
+        if actor_id:
+            await log_user_activity(
+                core_db,
+                actor_id if isinstance(actor_id, ObjectId) else ObjectId(str(actor_id)),
+                "file.deleted",
+                f"Deleted task: {task.get('title') or task_id}",
+                project_id=project_oid,
+                event_type="file.deleted",
+                resource_type="task",
+                resource_id=str(task_oid),
+                role="project-manager",
+                payload={
+                    "task_id": str(task_oid),
+                    "title": task.get("title"),
+                    "task_type": task.get("task_type"),
+                    "media_type": task.get("task_type"),
+                },
+            )
+    except Exception:
+        pass
     
     return {"message": "Task deleted successfully"}
 
@@ -1132,7 +1260,15 @@ async def finalize_media_upload(
     )
 
     if body.media_type not in MEDIA_SIZE_LIMITS:
-        raise HTTPException(status_code=400, detail="media_type must be image, video, or audio")
+        raise HTTPException(
+            status_code=400,
+            detail="media_type must be image, video, audio, or pdf",
+        )
+    _validate_media_meta(
+        body.media_type,
+        body.mime_type or ("application/pdf" if body.media_type == "pdf" else ""),
+        body.file_size or 1,
+    )
 
     if not body.drive_file_id or not body.drive_file_id.strip():
         raise HTTPException(status_code=400, detail="drive_file_id is required")
@@ -1170,16 +1306,20 @@ async def finalize_media_upload(
         drive_result["file_size"] = body.file_size
 
     project_db = await get_project_db(project_id)
-    media_key = body.media_type  # image | video | audio
+    media_key = body.media_type  # image | video | audio | pdf
+    is_pdf = media_key == "pdf"
+    task_type = TaskType.PDF_DOCUMENT_CODING.value if is_pdf else media_key
+
     task_doc = {
         "title": body.title.strip() or drive_result.get("original_filename") or "Untitled",
-        "task_type": media_key,
+        "task_type": task_type,
         "payload": {
             "text": None,
             "url": None,
             "image": None,
             "video": None,
             "audio": None,
+            "pdf": None,
             "meta": {},
         },
         "status": "open",
@@ -1188,15 +1328,38 @@ async def finalize_media_upload(
         "created_at": datetime.utcnow(),
         "updated_at": datetime.utcnow(),
     }
-    task_doc["payload"][media_key] = {
+    payload_key = "pdf" if is_pdf else media_key
+    task_doc["payload"][payload_key] = {
         **drive_result,
         "uploaded_at": datetime.utcnow(),
     }
+    if is_pdf:
+        task_doc["payload"][payload_key]["page_count"] = None
 
     try:
         result = await project_db.tasks.insert_one(task_doc)
         task_id = result.inserted_id
-        logger.info(f"Created {media_key} task via resumable upload: {task_id}")
+        logger.info(f"Created {task_type} task via resumable upload: {task_id}")
+
+        if is_pdf:
+            try:
+                await project_db.pdf_documents.insert_one({
+                    "task_id": task_id,
+                    "file_name": drive_result.get("original_filename") or "document.pdf",
+                    "drive_file_id": drive_result.get("drive_file_id"),
+                    "drive_file_url": drive_result.get("drive_file_url"),
+                    "mime_type": drive_result.get("mime_type") or "application/pdf",
+                    "file_size": drive_result.get("file_size"),
+                    "page_count": None,
+                    "uploaded_by": ObjectId(user_id),
+                    "extracted_text": None,
+                    "summary": None,
+                    "summary_model": None,
+                    "created_at": datetime.utcnow(),
+                    "updated_at": datetime.utcnow(),
+                })
+            except Exception as pdf_err:
+                logger.warning(f"pdf_documents create failed (non-fatal): {pdf_err}")
 
         # Auto-trigger transcription for audio/video tasks
         if media_key in ("audio", "video"):
@@ -1230,11 +1393,35 @@ async def finalize_media_upload(
                 # Non-fatal: task was created, transcription can be triggered manually
                 logger.warning(f"Auto-transcription queue failed (non-fatal): {tx_err}")
 
+        try:
+            from services.activity_log_service import log_user_activity
+            await log_user_activity(
+                get_core_db(),
+                ObjectId(user_id),
+                "file.uploaded",
+                f"Uploaded {task_type} task: {task_doc['title']}",
+                project_id=project_oid,
+                event_type="file.uploaded",
+                resource_type="task",
+                resource_id=str(task_id),
+                role="project-manager",
+                payload={
+                    "task_id": str(task_id),
+                    "title": task_doc["title"],
+                    "filename": body.original_filename,
+                    "task_type": task_type,
+                    "media_type": media_key,
+                },
+            )
+        except Exception:
+            pass
+
         return {
             "success": True,
             "task_id": str(task_id),
-            f"{media_key}_url": drive_result["drive_file_url"],
-            "message": f"{media_key.capitalize()} task created successfully",
+            "task_type": task_type,
+            f"{payload_key}_url": drive_result.get("drive_file_url"),
+            "message": f"{task_type} task created successfully",
             "transcription_queued": media_key in ("audio", "video"),
         }
     except Exception as e:
@@ -1253,20 +1440,26 @@ async def finalize_multimodal_upload(
     token: str = Query(...),
 ):
     """
-    After browser uploaded multiple Drive files: create ONE multimodal task
-    with image/video/audio payload slots (at most one of each).
+    After browser uploaded Drive files: create ONE multimodal task with
+    image / video / audio / pdf slots (at most one of each) + optional text.
     """
     user_id, project, _manager, drive_service, project_oid = await _resolve_manager_drive_context(
         project_id, token
     )
 
-    if not body.items:
-        raise HTTPException(status_code=400, detail="At least one media item is required")
+    if not body.items and not (body.text and body.text.strip()):
+        raise HTTPException(
+            status_code=400,
+            detail="At least one media item or text is required",
+        )
 
     seen_types = set()
     for item in body.items:
-        if item.media_type not in MEDIA_SIZE_LIMITS:
-            raise HTTPException(status_code=400, detail=f"Invalid media_type: {item.media_type}")
+        if item.media_type not in MULTIMODAL_MEDIA_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid media_type: {item.media_type}. Allowed: image, video, audio, pdf",
+            )
         if item.media_type in seen_types:
             raise HTTPException(
                 status_code=400,
@@ -1275,9 +1468,14 @@ async def finalize_multimodal_upload(
         seen_types.add(item.media_type)
         if not item.drive_file_id or not item.drive_file_id.strip():
             raise HTTPException(status_code=400, detail="drive_file_id is required for each item")
+        _validate_media_meta(
+            item.media_type,
+            item.mime_type or ("application/pdf" if item.media_type == "pdf" else ""),
+            item.file_size or 1,
+        )
 
     folder_id = project.get("drive_folder_id")
-    if not folder_id:
+    if body.items and not folder_id:
         raise HTTPException(
             status_code=400,
             detail="Project Drive folder not found. Please init upload first.",
@@ -1289,6 +1487,7 @@ async def finalize_multimodal_upload(
         "image": None,
         "video": None,
         "audio": None,
+        "pdf": None,
         "meta": {"modalities": sorted(seen_types)},
     }
 
@@ -1316,10 +1515,17 @@ async def finalize_multimodal_upload(
         if item.file_size:
             drive_result["file_size"] = item.file_size
 
-        payload[item.media_type] = {
-            **drive_result,
-            "uploaded_at": datetime.utcnow(),
-        }
+        if item.media_type == "pdf":
+            payload["pdf"] = {
+                **drive_result,
+                "page_count": None,
+                "uploaded_at": datetime.utcnow(),
+            }
+        else:
+            payload[item.media_type] = {
+                **drive_result,
+                "uploaded_at": datetime.utcnow(),
+            }
 
     project_db = await get_project_db(project_id)
     title = body.title.strip()
@@ -1328,6 +1534,12 @@ async def finalize_multimodal_upload(
             (i.original_filename for i in body.items if i.original_filename),
             "Multimodal Task",
         )
+
+    if payload.get("text"):
+        mods = list(payload["meta"].get("modalities") or [])
+        if "text" not in mods:
+            mods.append("text")
+            payload["meta"]["modalities"] = sorted(mods)
 
     task_doc = {
         "title": title,
@@ -1343,7 +1555,29 @@ async def finalize_multimodal_upload(
     try:
         result = await project_db.tasks.insert_one(task_doc)
         task_id = result.inserted_id
-        logger.info(f"Created multimodal task {task_id} with modalities={sorted(seen_types)}")
+        logger.info(f"Created multimodal task {task_id} with modalities={payload['meta']['modalities']}")
+
+        # PDF coding workspace looks up pdf_documents by task_id
+        if payload.get("pdf"):
+            pdf_payload = payload["pdf"]
+            try:
+                await project_db.pdf_documents.insert_one({
+                    "task_id": task_id,
+                    "file_name": pdf_payload.get("original_filename") or "document.pdf",
+                    "drive_file_id": pdf_payload.get("drive_file_id"),
+                    "drive_file_url": pdf_payload.get("drive_file_url"),
+                    "mime_type": pdf_payload.get("mime_type") or "application/pdf",
+                    "file_size": pdf_payload.get("file_size"),
+                    "page_count": None,
+                    "uploaded_by": ObjectId(user_id),
+                    "extracted_text": None,
+                    "summary": None,
+                    "summary_model": None,
+                    "created_at": datetime.utcnow(),
+                    "updated_at": datetime.utcnow(),
+                })
+            except Exception as pdf_err:
+                logger.warning(f"pdf_documents create failed for multimodal (non-fatal): {pdf_err}")
 
         transcription_queued = False
         if "audio" in seen_types or "video" in seen_types:
