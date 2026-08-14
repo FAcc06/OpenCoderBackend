@@ -19,9 +19,11 @@ router = APIRouter()
 # OpenRouter配置
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_MODEL = os.getenv("LLM_MODEL", "anthropic/claude-3.5-haiku")
+DEFAULT_MODEL = os.getenv("LLM_MODEL", "openai/gpt-4o-mini")
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.3"))
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "2000"))
+# Annotate uses a reliable general chat model unless overridden
+ANNOTATION_MODEL = os.getenv("ANNOTATION_MODEL", DEFAULT_MODEL)
 
 # Prompt模板目录
 PROMPT_DIR = Path(__file__).parent.parent / "prompts"
@@ -47,9 +49,11 @@ class MonthlyReportRequest(BaseModel):
 
 
 class AnnotationRequest(BaseModel):
-    """标注请求"""
-    sentence: str
-    tag_groups: List[Dict]  # 从其他端口获取的标签组配置
+    """标注请求 — selected content + full codebook (+ optional project context)."""
+    sentence: str  # selected / task content to code
+    tag_groups: List[Dict]  # groups with options + descriptions
+    project_id: Optional[str] = None
+    project_memo: Optional[str] = None
     model: Optional[str] = None
 
 
@@ -87,7 +91,8 @@ async def call_openrouter(
     messages: List[Dict[str, str]],
     model: str = DEFAULT_MODEL,
     temperature: float = LLM_TEMPERATURE,
-    max_tokens: int = LLM_MAX_TOKENS
+    max_tokens: int = LLM_MAX_TOKENS,
+    force_json: bool = True,
 ) -> Dict:
     """调用OpenRouter API"""
     if not OPENROUTER_API_KEY:
@@ -108,17 +113,29 @@ async def call_openrouter(
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
-        "response_format": {"type": "json_object"}  # 强制JSON输出
     }
+    if force_json:
+        payload["response_format"] = {"type": "json_object"}
     
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=90.0) as client:
             response = await client.post(
                 f"{OPENROUTER_BASE_URL}/chat/completions",
                 headers=headers,
                 json=payload
             )
             
+            # Some models reject response_format — retry once without it
+            if response.status_code != 200 and force_json:
+                err_text = response.text or ""
+                if "response_format" in err_text.lower() or response.status_code in (400, 422):
+                    payload.pop("response_format", None)
+                    response = await client.post(
+                        f"{OPENROUTER_BASE_URL}/chat/completions",
+                        headers=headers,
+                        json=payload
+                    )
+
             if response.status_code != 200:
                 raise HTTPException(
                     status_code=response.status_code,
@@ -129,8 +146,50 @@ async def call_openrouter(
             
     except httpx.TimeoutException:
         raise HTTPException(status_code=504, detail="LLM request timeout")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM call failed: {str(e)}")
+
+
+def _parse_llm_json(content: str) -> Dict:
+    """Parse model JSON, tolerating markdown fences."""
+    text = (content or "").strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        # drop first fence and optional last fence
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+        if text.lower().startswith("json"):
+            text = text[4:].lstrip()
+    return json.loads(text)
+
+
+def _format_tag_groups_for_prompt(tag_groups: List[Dict]) -> str:
+    """Rich codebook block: group desc + each tag value/label/description."""
+    blocks = []
+    for group in tag_groups:
+        gid = group.get("group_id") or group.get("id") or ""
+        gname = group.get("group_name") or group.get("name") or gid
+        gtype = group.get("type") or "single"
+        gdesc = (group.get("description") or group.get("group_description") or "").strip()
+        lines = [f"### Group `{gid}` — {gname} ({gtype})"]
+        if gdesc:
+            lines.append(f"Group description: {gdesc}")
+        lines.append("Options:")
+        for opt in group.get("options") or []:
+            val = opt.get("value") or opt.get("option_id") or opt.get("label") or ""
+            lab = opt.get("label") or val
+            odesc = (opt.get("description") or "").strip()
+            if odesc:
+                lines.append(f"  - value=`{val}` | label={lab} | description: {odesc}")
+            else:
+                lines.append(f"  - value=`{val}` | label={lab}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks) if blocks else "(no tag groups)"
 
 
 async def fetch_project_data(project_id: str, start_date: str, end_date: str) -> Dict:
@@ -605,79 +664,46 @@ async def annotate_sentence(
     token: str = Query(...)
 ):
     """
-    对句子进行标注建议
-    
-    请求示例：
-    ```json
-    {
-        "sentence": "这部电影非常精彩，值得一看！",
-        "tag_groups": [
-            {
-                "group_id": "sentiment",
-                "group_name": "情感倾向",
-                "type": "single",
-                "options": [
-                    {"value": "positive", "label": "正面"},
-                    {"value": "negative", "label": "负面"},
-                    {"value": "neutral", "label": "中立"}
-                ]
-            },
-            {
-                "group_id": "topic",
-                "group_name": "话题分类",
-                "type": "multi",
-                "options": [
-                    {"value": "entertainment", "label": "娱乐"},
-                    {"value": "movie", "label": "电影"},
-                    {"value": "recommendation", "label": "推荐"}
-                ]
-            }
-        ],
-        "model": "anthropic/claude-3.5-haiku"
-    }
-    ```
-    
-    响应格式（固定）：
-    ```json
-    {
-        "success": true,
-        "annotation": {
-            "sentence": "这部电影非常精彩，值得一看！",
-            "labels": [
-                {
-                    "group_id": "sentiment",
-                    "group_name": "情感倾向",
-                    "selected": ["positive"],
-                    "confidence": 0.95
-                },
-                {
-                    "group_id": "topic",
-                    "group_name": "话题分类",
-                    "selected": ["entertainment", "movie", "recommendation"],
-                    "confidence": 0.88
-                }
-            ],
-            "overall_confidence": 0.92,
-            "reasoning": "文本明确表达了对电影的正面评价..."
-        },
-        "metadata": {
-            "generated_at": "2024-01-20T10:00:00Z",
-            "model_used": "anthropic/claude-3.5-haiku",
-            "cost": 0.0003
-        }
-    }
-    ```
+    Suggest codebook labels for selected content.
+    Sends: content + all tag groups/options (with descriptions) + project memo.
     """
-    # 验证用户权限
     try:
-        print(f"🔍 [Annotate] Received token: {token[:50]}..." if len(token) > 50 else f"🔍 [Annotate] Received token: {token}")
-        user = verify_token(token)  # verify_token不是async函数
+        user = verify_token(token)
         print(f"✅ [Annotate] Token verified, user: {user}")
     except Exception as e:
         print(f"❌ [Annotate] Token verification failed: {str(e)}")
         raise HTTPException(status_code=401, detail="Invalid token")
-    
-    # 1. 加载Prompt模板
+
+    content = (request.sentence or "").strip()
+    if not content:
+        raise HTTPException(
+            status_code=400,
+            detail="No content to annotate. Select or provide text for this task.",
+        )
+    if not request.tag_groups:
+        raise HTTPException(status_code=400, detail="No tag groups provided")
+
+    # Resolve project memo (request override, else load from DB)
+    project_memo = (request.project_memo or "").strip()
+    if not project_memo and request.project_id:
+        try:
+            from bson import ObjectId
+            core_db = get_core_db()
+            proj = await core_db.projects.find_one(
+                {"_id": ObjectId(request.project_id)},
+                {"memo": 1, "name": 1, "description": 1},
+            )
+            if proj:
+                project_memo = (
+                    (proj.get("memo") or proj.get("description") or "").strip()
+                    or f"Project: {proj.get('name') or request.project_id}"
+                )
+        except Exception as e:
+            print(f"⚠️ [Annotate] Could not load project memo: {e}")
+
+    if not project_memo:
+        project_memo = "(No project memo provided.)"
+
     try:
         prompt_template = load_prompt_template("annotation")
     except Exception as e:
@@ -685,71 +711,144 @@ async def annotate_sentence(
             status_code=500,
             detail=f"Failed to load prompt template: {str(e)}"
         )
-    
-    # 2. 构建标签组描述
-    tag_groups_desc = []
-    for group in request.tag_groups:
-        options_str = ", ".join([f"{opt['value']}({opt['label']})" for opt in group["options"]])
-        tag_groups_desc.append(
-            f"- {group['group_name']} ({group['type']}): {options_str}"
-        )
-    
-    # 3. 填充Prompt
-    prompt = prompt_template.format(
-        sentence=request.sentence,
-        tag_groups="\n".join(tag_groups_desc),
-        num_groups=len(request.tag_groups)
+
+    tag_groups_block = _format_tag_groups_for_prompt(request.tag_groups)
+
+    # Avoid str.format() — content may contain braces
+    prompt = (
+        prompt_template
+        .replace("{project_memo}", project_memo)
+        .replace("{sentence}", content)
+        .replace("{tag_groups}", tag_groups_block)
+        .replace("{num_groups}", str(len(request.tag_groups)))
     )
-    
-    # 4. 调用LLM
-    model = request.model or DEFAULT_MODEL
+
+    model = request.model or ANNOTATION_MODEL
     messages = [
         {
             "role": "system",
-            "content": "You are a professional text annotation expert. Always return valid JSON format."
+            "content": (
+                "You are a professional qualitative coding assistant. "
+                "Always reply with valid JSON only."
+            ),
         },
-        {
-            "role": "user",
-            "content": prompt
-        }
+        {"role": "user", "content": prompt},
     ]
-    
+
     try:
         response = await call_openrouter(
             messages=messages,
             model=model,
-            temperature=0.3,
-            max_tokens=1000
+            temperature=0.2,
+            max_tokens=2000,
+            force_json=True,
         )
-        
-        content = response["choices"][0]["message"]["content"]
-        annotation_result = json.loads(content)
-        
-        # 5. 格式化为固定输出格式
+
+        raw = response["choices"][0]["message"]["content"]
+        annotation_result = _parse_llm_json(raw)
+
+        # Normalize labels map: support dict keyed by group_id OR list
+        labels_raw = annotation_result.get("labels") or {}
+        if isinstance(labels_raw, list):
+            labels_map = {
+                (item.get("group_id") or ""): item
+                for item in labels_raw
+                if isinstance(item, dict)
+            }
+        else:
+            labels_map = labels_raw if isinstance(labels_raw, dict) else {}
+
+        # Allowed values per group for validation
+        allowed: Dict[str, set] = {}
+        for group in request.tag_groups:
+            gid = group.get("group_id") or ""
+            vals = set()
+            for opt in group.get("options") or []:
+                v = opt.get("value") or opt.get("option_id") or opt.get("label")
+                if v:
+                    vals.add(str(v))
+                    if opt.get("label"):
+                        vals.add(str(opt["label"]))  # tolerate label returns briefly
+            allowed[gid] = vals
+
         labels = []
         for group in request.tag_groups:
-            group_result = annotation_result.get("labels", {}).get(group["group_id"], {})
+            gid = group.get("group_id") or ""
+            gname = group.get("group_name") or group.get("name") or gid
+            gtype = group.get("type") or "single"
+            group_result = labels_map.get(gid) or {}
+            if not isinstance(group_result, dict):
+                group_result = {}
+            selected = group_result.get("selected") or []
+            if not isinstance(selected, list):
+                selected = [selected] if selected else []
+
+            # Map labels → values when model returned display labels
+            value_by_label = {}
+            for opt in group.get("options") or []:
+                val = str(opt.get("value") or opt.get("option_id") or opt.get("label") or "")
+                lab = str(opt.get("label") or val)
+                if lab:
+                    value_by_label[lab.lower()] = val
+                if val:
+                    value_by_label[val.lower()] = val
+
+            normalized = []
+            for s in selected:
+                key = str(s).strip()
+                mapped = value_by_label.get(key.lower())
+                if mapped:
+                    normalized.append(mapped)
+            # Deduplicate, respect single
+            seen = set()
+            deduped = []
+            for v in normalized:
+                if v not in seen:
+                    seen.add(v)
+                    deduped.append(v)
+            if gtype == "single" and len(deduped) > 1:
+                deduped = deduped[:1]
+
+            conf = group_result.get("confidence", 0.5)
+            try:
+                conf = float(conf)
+            except Exception:
+                conf = 0.5
+
             labels.append({
-                "group_id": group["group_id"],
-                "group_name": group["group_name"],
-                "selected": group_result.get("selected", []),
-                "confidence": group_result.get("confidence", 0.5)
+                "group_id": gid,
+                "group_name": gname,
+                "selected": deduped,
+                "confidence": conf,
             })
-        
+
+        overall = annotation_result.get("overall_confidence", 0.5)
+        try:
+            overall = float(overall)
+        except Exception:
+            overall = 0.5
+
         return {
             "success": True,
             "annotation": {
-                "sentence": request.sentence,
+                "sentence": content,
                 "labels": labels,
-                "overall_confidence": annotation_result.get("overall_confidence", 0.5),
-                "reasoning": annotation_result.get("reasoning", "")
+                "overall_confidence": overall,
+                "reasoning": annotation_result.get("reasoning") or "",
             },
             "metadata": {
                 "generated_at": datetime.utcnow().isoformat(),
                 "model_used": model,
-                "cost": 0.0003
-            }
+                "cost": 0.0,
+            },
         }
-        
+
+    except HTTPException:
+        raise
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Model returned invalid JSON: {str(e)}",
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to annotate: {str(e)}")

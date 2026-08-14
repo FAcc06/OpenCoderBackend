@@ -19,7 +19,7 @@ router = APIRouter()
 # OpenRouter配置
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_MODEL = os.getenv("LLM_MODEL", "anthropic/claude-3.5-haiku")
+DEFAULT_MODEL = os.getenv("LLM_MODEL", "openai/gpt-4o-mini")
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.3"))
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "2000"))
 
