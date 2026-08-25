@@ -61,6 +61,7 @@ else:
     allowed_origins = [
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "http://localhost:3000",
         "http://localhost:8000",
     ]
 
@@ -75,6 +76,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],  # 允许所有HTTP方法
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # 启动时打印CORS配置

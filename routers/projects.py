@@ -15,6 +15,28 @@ router = APIRouter()
 class ClusterUriUpdate(BaseModel):
     cluster_uri: Optional[str] = None
 
+
+class ProjectSettingsUpdate(BaseModel):
+    """Manager Settings — database + LLM overrides for this project."""
+    cluster_uri: Optional[str] = None
+    llm_enabled: Optional[bool] = None
+    openrouter_api_key: Optional[str] = None  # empty string clears override
+    llm_model: Optional[str] = None
+    annotation_model: Optional[str] = None
+
+
+class OpenRouterKeyCheck(BaseModel):
+    """Optional key to test; if omitted/blank, uses the project's saved key."""
+    openrouter_api_key: Optional[str] = None
+
+
+def _mask_secret(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    if len(value) <= 12:
+        return "***"
+    return f"{value[:8]}…{value[-4:]}"
+
 def validate_mongodb_uri(uri: str) -> bool:
     """验证MongoDB URI格式"""
     if not uri:
@@ -291,6 +313,313 @@ async def get_cluster_uri_status(project_id: str):
         "cluster_uri": cluster_uri,
         "cluster_uri_masked": f"{cluster_uri[:20]}...{cluster_uri[-10:]}" if cluster_uri and len(cluster_uri) > 30 else cluster_uri
     }
+
+
+@router.get("/{project_id}/settings")
+async def get_project_settings(project_id: str, token: str = Query(...)):
+    """
+    Manager Settings (masked secrets).
+    Includes MongoDB Atlas URI status + LLM overrides for this project.
+    """
+    from services.membership_service import is_project_manager
+    from jose import jwt, JWTError
+    import os
+
+    core_db = get_core_db()
+    try:
+        project_oid = ObjectId(project_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid project ID")
+
+    SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
+    ALGORITHM = os.getenv("ALGORITHM", "HS256")
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_oid = ObjectId(payload["sub"])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    if not await is_project_manager(core_db, user_oid, project_oid):
+        raise HTTPException(status_code=403, detail="Only managers can view project settings")
+
+    project = await core_db.projects.find_one({"_id": project_oid})
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    cluster_uri = project.get("cluster_uri") or ""
+    llm = project.get("llm_settings") or {}
+    key = llm.get("openrouter_api_key") or ""
+    # Default on so existing projects keep basic AI unless managers turn it off
+    llm_enabled = llm.get("llm_enabled", True)
+    if not isinstance(llm_enabled, bool):
+        llm_enabled = True
+
+    return {
+        "project_id": project_id,
+        "cluster_uri": cluster_uri,
+        "cluster_uri_masked": _mask_secret(cluster_uri) if cluster_uri else None,
+        "has_cluster_uri": bool(cluster_uri),
+        "llm_enabled": llm_enabled,
+        "openrouter_api_key_masked": _mask_secret(key) if key else None,
+        "has_openrouter_api_key": bool(key),
+        "llm_model": llm.get("llm_model") or "",
+        "annotation_model": llm.get("annotation_model") or "",
+        "defaults": {
+            "llm_model": os.getenv("LLM_MODEL", "openai/gpt-4o-mini"),
+            "annotation_model": os.getenv("ANNOTATION_MODEL", "openai/gpt-4o-mini"),
+            "server_has_openrouter_key": bool(os.getenv("OPENROUTER_API_KEY")),
+            "basic_model": os.getenv("ANNOTATION_MODEL", "openai/gpt-4o-mini"),
+        },
+    }
+
+
+@router.patch("/{project_id}/settings")
+async def update_project_settings(
+    project_id: str,
+    data: ProjectSettingsUpdate,
+    token: str = Query(...),
+):
+    """Update Manager Settings: Atlas URI and/or LLM overrides."""
+    from services.membership_service import is_project_manager
+    from jose import jwt
+    import os
+
+    core_db = get_core_db()
+    try:
+        project_oid = ObjectId(project_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid project ID")
+
+    SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
+    ALGORITHM = os.getenv("ALGORITHM", "HS256")
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_oid = ObjectId(payload["sub"])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    if not await is_project_manager(core_db, user_oid, project_oid):
+        raise HTTPException(status_code=403, detail="Only managers can update project settings")
+
+    project = await core_db.projects.find_one({"_id": project_oid})
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    updates: dict = {"updated_at": datetime.utcnow()}
+    llm = dict(project.get("llm_settings") or {})
+
+    if data.cluster_uri is not None:
+        uri = data.cluster_uri.strip()
+        if uri and not validate_mongodb_uri(uri):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid MongoDB URI. Must start with mongodb:// or mongodb+srv://",
+            )
+        # Prefer Atlas for this Settings UI
+        if uri and not uri.startswith("mongodb+srv://"):
+            raise HTTPException(
+                status_code=400,
+                detail="Only MongoDB Atlas URIs are accepted (must start with mongodb+srv://)",
+            )
+        updates["cluster_uri"] = uri or None
+
+    if data.llm_enabled is not None:
+        llm["llm_enabled"] = bool(data.llm_enabled)
+
+    if data.openrouter_api_key is not None:
+        key = data.openrouter_api_key.strip()
+        if key:
+            llm["openrouter_api_key"] = key
+        else:
+            llm.pop("openrouter_api_key", None)
+
+    if data.llm_model is not None:
+        model = data.llm_model.strip()
+        if model:
+            llm["llm_model"] = model
+        else:
+            llm.pop("llm_model", None)
+
+    if data.annotation_model is not None:
+        model = data.annotation_model.strip()
+        if model:
+            llm["annotation_model"] = model
+        else:
+            llm.pop("annotation_model", None)
+
+    updates["llm_settings"] = llm
+
+    await core_db.projects.update_one({"_id": project_oid}, {"$set": updates})
+
+    return {"success": True, "message": "Settings saved"}
+
+
+@router.post("/{project_id}/settings/verify-openrouter-key")
+async def verify_openrouter_key(
+    project_id: str,
+    data: OpenRouterKeyCheck,
+    token: str = Query(...),
+):
+    """
+    Check OpenRouter key eligibility via GET https://openrouter.ai/api/v1/key
+    Uses the pasted key, or the project's saved key if the field is blank.
+    """
+    from services.membership_service import is_project_manager
+    from jose import jwt
+    import os
+    import httpx
+
+    core_db = get_core_db()
+    try:
+        project_oid = ObjectId(project_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid project ID")
+
+    SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
+    ALGORITHM = os.getenv("ALGORITHM", "HS256")
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_oid = ObjectId(payload["sub"])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    if not await is_project_manager(core_db, user_oid, project_oid):
+        raise HTTPException(status_code=403, detail="Only managers can verify API keys")
+
+    project = await core_db.projects.find_one({"_id": project_oid})
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    key = (data.openrouter_api_key or "").strip()
+    used_saved = False
+    if not key:
+        llm = project.get("llm_settings") or {}
+        key = (llm.get("openrouter_api_key") or "").strip()
+        used_saved = bool(key)
+    if not key:
+        raise HTTPException(
+            status_code=400,
+            detail="Paste an OpenRouter API key to check, or save one first.",
+        )
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            res = await client.get(
+                "https://openrouter.ai/api/v1/key",
+                headers={"Authorization": f"Bearer {key}"},
+            )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not reach OpenRouter: {e}")
+
+    if res.status_code == 401:
+        return {
+            "valid": False,
+            "eligible": False,
+            "message": "Invalid API key (OpenRouter returned 401).",
+            "checked_saved_key": used_saved,
+        }
+    if res.status_code != 200:
+        detail = (res.text or "")[:300]
+        return {
+            "valid": False,
+            "eligible": False,
+            "message": f"OpenRouter error HTTP {res.status_code}: {detail}",
+            "checked_saved_key": used_saved,
+        }
+
+    body = res.json() if res.content else {}
+    info = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(info, dict):
+        info = body if isinstance(body, dict) else {}
+
+    limit_remaining = info.get("limit_remaining")
+    usage = info.get("usage")
+    limit = info.get("limit")
+    is_free_tier = info.get("is_free_tier")
+    label = info.get("label")
+
+    # Eligible if authenticated; warn when per-key remaining credits are exhausted
+    eligible = True
+    notes = []
+    if limit_remaining is not None:
+        try:
+            if float(limit_remaining) <= 0:
+                eligible = False
+                notes.append("Key credit limit remaining is 0.")
+        except (TypeError, ValueError):
+            pass
+
+    msg_parts = ["API key is valid."]
+    if label:
+        msg_parts.append(f"Label: {label}.")
+    if limit is not None:
+        msg_parts.append(f"Limit: {limit}.")
+    if limit_remaining is not None:
+        msg_parts.append(f"Remaining: {limit_remaining}.")
+    if usage is not None:
+        msg_parts.append(f"Usage: {usage}.")
+    if is_free_tier is not None:
+        msg_parts.append(f"Free tier: {is_free_tier}.")
+    if notes:
+        msg_parts.extend(notes)
+
+    return {
+        "valid": True,
+        "eligible": eligible,
+        "message": " ".join(msg_parts),
+        "checked_saved_key": used_saved,
+        "data": {
+            "label": label,
+            "limit": limit,
+            "limit_remaining": limit_remaining,
+            "limit_reset": info.get("limit_reset"),
+            "usage": usage,
+            "is_free_tier": is_free_tier,
+        },
+    }
+
+
+@router.get("/{project_id}/ai-status")
+async def get_project_ai_status(project_id: str, token: str = Query(...)):
+    """
+    Lightweight flag for Coder UI: whether Get AI Suggestion is enabled.
+    Any project member (manager or coder) may read this — no secrets returned.
+    """
+    from services.membership_service import get_membership, is_project_manager
+    from jose import jwt
+    import os
+
+    core_db = get_core_db()
+    try:
+        project_oid = ObjectId(project_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid project ID")
+
+    SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
+    ALGORITHM = os.getenv("ALGORITHM", "HS256")
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_oid = ObjectId(payload["sub"])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    user = await core_db.users.find_one({"_id": user_oid})
+    membership = await get_membership(core_db, user_oid, project_oid)
+    is_mgr = await is_project_manager(core_db, user_oid, project_oid)
+    legacy_ok = user and str(user.get("project_id") or "") == str(project_oid)
+    if not membership and not is_mgr and not legacy_ok:
+        raise HTTPException(status_code=403, detail="Not a member of this project")
+
+    project = await core_db.projects.find_one({"_id": project_oid}, {"llm_settings": 1})
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    llm = project.get("llm_settings") or {}
+    enabled = llm.get("llm_enabled", True)
+    if not isinstance(enabled, bool):
+        enabled = True
+
+    return {"llm_enabled": enabled}
 
 
 @router.get("/{project_id}/intercoder-reliability")

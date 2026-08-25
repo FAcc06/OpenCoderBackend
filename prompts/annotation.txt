@@ -17,14 +17,14 @@ Rules:
 5. Give a confidence 0.0–1.0 per group and overall.
 6. Reasoning: 1–3 short sentences citing the content and codebook.
 
-Return STRICT JSON only (no markdown):
-{{
-  "labels": {{
-    "GROUP_ID": {{
+Return STRICT JSON only (no markdown), with this shape:
+{
+  "labels": {
+    "GROUP_ID": {
       "selected": ["option_value"],
       "confidence": 0.0
-    }}
-  }},
+    }
+  },
   "overall_confidence": 0.0,
   "reasoning": "..."
-}}
+}

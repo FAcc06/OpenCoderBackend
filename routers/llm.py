@@ -22,8 +22,8 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_MODEL = os.getenv("LLM_MODEL", "openai/gpt-4o-mini")
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.3"))
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "2000"))
-# Annotate uses a reliable general chat model unless overridden
-ANNOTATION_MODEL = os.getenv("ANNOTATION_MODEL", DEFAULT_MODEL)
+# Ordinary chat model for coding suggestions (not a specialized free/unstable model)
+ANNOTATION_MODEL = os.getenv("ANNOTATION_MODEL", "openai/gpt-4o-mini")
 
 # Prompt模板目录
 PROMPT_DIR = Path(__file__).parent.parent / "prompts"
@@ -93,16 +93,18 @@ async def call_openrouter(
     temperature: float = LLM_TEMPERATURE,
     max_tokens: int = LLM_MAX_TOKENS,
     force_json: bool = True,
+    api_key: Optional[str] = None,
 ) -> Dict:
-    """调用OpenRouter API"""
-    if not OPENROUTER_API_KEY:
+    """调用OpenRouter API。api_key 可覆盖环境变量（项目 Settings）。"""
+    key = (api_key or OPENROUTER_API_KEY or "").strip()
+    if not key:
         raise HTTPException(
             status_code=500,
-            detail="OPENROUTER_API_KEY not configured"
+            detail="OPENROUTER_API_KEY not configured (set in server .env or project Settings)"
         )
     
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
         "HTTP-Referer": os.getenv("APP_URL", "http://localhost:8000"),
         "X-Title": "OpenCoder"
@@ -683,23 +685,47 @@ async def annotate_sentence(
     if not request.tag_groups:
         raise HTTPException(status_code=400, detail="No tag groups provided")
 
-    # Resolve project memo (request override, else load from DB)
+    # Resolve project memo + optional LLM overrides from Settings
     project_memo = (request.project_memo or "").strip()
-    if not project_memo and request.project_id:
+    project_api_key: Optional[str] = None
+    project_annotation_model: Optional[str] = None
+    if request.project_id:
         try:
             from bson import ObjectId
             core_db = get_core_db()
             proj = await core_db.projects.find_one(
                 {"_id": ObjectId(request.project_id)},
-                {"memo": 1, "name": 1, "description": 1},
+                {"memo": 1, "name": 1, "description": 1, "llm_settings": 1},
             )
             if proj:
-                project_memo = (
-                    (proj.get("memo") or proj.get("description") or "").strip()
-                    or f"Project: {proj.get('name') or request.project_id}"
+                if not project_memo:
+                    project_memo = (
+                        (proj.get("memo") or proj.get("description") or "").strip()
+                        or f"Project: {proj.get('name') or request.project_id}"
+                    )
+                llm_cfg = proj.get("llm_settings") or {}
+                llm_enabled = llm_cfg.get("llm_enabled", True)
+                if llm_enabled is False:
+                    raise HTTPException(
+                        status_code=403,
+                        detail=(
+                            "AI features are disabled for this project. "
+                            "A manager can enable them under Settings → AI / OpenRouter."
+                        ),
+                    )
+                project_api_key = (llm_cfg.get("openrouter_api_key") or "").strip() or None
+                project_annotation_model = (
+                    (llm_cfg.get("annotation_model") or llm_cfg.get("llm_model") or "").strip()
+                    or None
                 )
+                # Without a project API key, only the platform basic model is allowed
+                # (uses the server key / quota). Own key unlocks custom models + own quota.
+                if not project_api_key:
+                    project_annotation_model = None
+        except HTTPException:
+            raise
         except Exception as e:
-            print(f"⚠️ [Annotate] Could not load project memo: {e}")
+            print(f"⚠️ [Annotate] Could not load project settings: {e}")
 
     if not project_memo:
         project_memo = "(No project memo provided.)"
@@ -714,7 +740,7 @@ async def annotate_sentence(
 
     tag_groups_block = _format_tag_groups_for_prompt(request.tag_groups)
 
-    # Avoid str.format() — content may contain braces
+    # Avoid str.format() — content may contain braces. Template uses single {placeholders}.
     prompt = (
         prompt_template
         .replace("{project_memo}", project_memo)
@@ -722,8 +748,17 @@ async def annotate_sentence(
         .replace("{tag_groups}", tag_groups_block)
         .replace("{num_groups}", str(len(request.tag_groups)))
     )
+    # Legacy templates may still use {{ }} from str.format era
+    if "{{" in prompt or "}}" in prompt:
+        prompt = prompt.replace("{{", "{").replace("}}", "}")
 
-    model = request.model or ANNOTATION_MODEL
+    # Prefer project Settings model when a project API key unlocks custom models.
+    # request.model is only a fallback (clients should not hardcode).
+    if project_api_key:
+        model = project_annotation_model or request.model or ANNOTATION_MODEL
+    else:
+        model = ANNOTATION_MODEL
+    print(f"🤖 [Annotate] model={model} content_len={len(content)} groups={len(request.tag_groups)}")
     messages = [
         {
             "role": "system",
@@ -742,9 +777,11 @@ async def annotate_sentence(
             temperature=0.2,
             max_tokens=2000,
             force_json=True,
+            api_key=project_api_key,
         )
 
         raw = response["choices"][0]["message"]["content"]
+        print(f"🤖 [Annotate] raw response len={len(raw or '')}")
         annotation_result = _parse_llm_json(raw)
 
         # Normalize labels map: support dict keyed by group_id OR list
