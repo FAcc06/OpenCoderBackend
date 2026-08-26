@@ -3,7 +3,7 @@ LLM Router - Using OpenRouter with Prompt Templates
 LLM路由，使用OpenRouter和外部Prompt模板
 """
 from fastapi import APIRouter, HTTPException, Query
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 from pydantic import BaseModel
 from datetime import datetime
 import os
@@ -24,6 +24,16 @@ LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.3"))
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "2000"))
 # Ordinary chat model for coding suggestions (not a specialized free/unstable model)
 ANNOTATION_MODEL = os.getenv("ANNOTATION_MODEL", "openai/gpt-4o-mini")
+
+# Report LLM provider: "openrouter" (default) | "illinois_chat"
+LLM_PROVIDER = (os.getenv("LLM_PROVIDER") or "openrouter").strip().lower()
+ILLINOIS_CHAT_URL = os.getenv(
+    "ILLINOIS_CHAT_URL",
+    "https://chat.illinois.edu/api/chat-api/chat",
+).strip()
+ILLINOIS_CHAT_API_KEY = (os.getenv("ILLINOIS_CHAT_API_KEY") or "").strip()
+ILLINOIS_CHAT_COURSE = (os.getenv("ILLINOIS_CHAT_COURSE") or "opencoder").strip()
+ILLINOIS_CHAT_MODEL = (os.getenv("ILLINOIS_CHAT_MODEL") or "gpt-4o-mini").strip()
 
 # Prompt模板目录
 PROMPT_DIR = Path(__file__).parent.parent / "prompts"
@@ -152,6 +162,190 @@ async def call_openrouter(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM call failed: {str(e)}")
+
+
+def _extract_illinois_text(payload: Any) -> str:
+    """Best-effort extract assistant text from Illinois Chat JSON / stream chunks."""
+    if payload is None:
+        return ""
+    if isinstance(payload, str):
+        return payload
+    if isinstance(payload, dict):
+        if isinstance(payload.get("message"), str):
+            return payload["message"]
+        msg = payload.get("message")
+        if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+            return msg["content"]
+        if isinstance(payload.get("content"), str):
+            return payload["content"]
+        choices = payload.get("choices")
+        if isinstance(choices, list) and choices:
+            ch0 = choices[0] or {}
+            if isinstance(ch0.get("delta"), dict) and ch0["delta"].get("content"):
+                return str(ch0["delta"]["content"])
+            if isinstance(ch0.get("message"), dict) and ch0["message"].get("content"):
+                return str(ch0["message"]["content"])
+            if isinstance(ch0.get("text"), str):
+                return ch0["text"]
+        if isinstance(payload.get("text"), str):
+            return payload["text"]
+        if isinstance(payload.get("error"), str):
+            raise HTTPException(status_code=502, detail=f"Illinois Chat error: {payload['error']}")
+        if isinstance(payload.get("message"), str) and payload.get("error"):
+            raise HTTPException(status_code=502, detail=str(payload.get("message")))
+    return ""
+
+
+async def call_illinois_chat(
+    messages: List[Dict[str, str]],
+    model: Optional[str] = None,
+    temperature: float = LLM_TEMPERATURE,
+    force_json: bool = False,
+) -> Dict:
+    """
+    Illinois Chat / uiuc.chat course chatbot API.
+    Uses env: ILLINOIS_CHAT_API_KEY, ILLINOIS_CHAT_COURSE, ILLINOIS_CHAT_MODEL, ILLINOIS_CHAT_URL.
+    Prefers non-streaming; falls back to aggregating a stream.
+    Returns OpenAI-shaped {choices:[{message:{content}}]} for callers.
+    """
+    key = ILLINOIS_CHAT_API_KEY
+    if not key:
+        raise HTTPException(
+            status_code=500,
+            detail="ILLINOIS_CHAT_API_KEY not configured (set in server .env)",
+        )
+    course = ILLINOIS_CHAT_COURSE
+    if not course:
+        raise HTTPException(
+            status_code=500,
+            detail="ILLINOIS_CHAT_COURSE not configured (set in server .env)",
+        )
+
+    use_model = (model or ILLINOIS_CHAT_MODEL or "gpt-4o-mini").strip()
+    # Strip OpenRouter-style prefixes if someone passes openai/gpt-4o-mini
+    if use_model and "/" in use_model and not use_model.startswith("llama"):
+        parts = use_model.split("/", 1)
+        if parts[0] in ("openai", "anthropic", "google", "meta-llama"):
+            use_model = parts[1]
+
+    msgs = list(messages)
+    if force_json:
+        # Illinois Chat has no response_format; reinforce JSON in system prompt
+        reinforced = (
+            "Respond with valid JSON only. Do not wrap in markdown fences. "
+            "Do not add commentary outside the JSON object."
+        )
+        if msgs and msgs[0].get("role") == "system":
+            msgs = [
+                {**msgs[0], "content": f"{msgs[0].get('content', '')}\n\n{reinforced}"},
+                *msgs[1:],
+            ]
+        else:
+            msgs = [{"role": "system", "content": reinforced}, *msgs]
+
+    # Illinois Chat API requires `model` on every request (course UI default is not applied).
+    body: Dict[str, Any] = {
+        "model": use_model,
+        "messages": msgs,
+        "api_key": key,
+        "course_name": course,
+        "stream": False,
+        "temperature": temperature,
+        "retrieval_only": False,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            # 1) Non-streaming
+            res = await client.post(ILLINOIS_CHAT_URL, headers={"Content-Type": "application/json"}, json=body)
+            text = ""
+            if res.status_code == 200:
+                try:
+                    data = res.json()
+                    text = _extract_illinois_text(data).strip()
+                except Exception:
+                    text = (res.text or "").strip()
+            else:
+                # 2) Streaming fallback
+                body["stream"] = True
+                async with client.stream(
+                    "POST",
+                    ILLINOIS_CHAT_URL,
+                    headers={"Content-Type": "application/json"},
+                    json=body,
+                ) as stream_res:
+                    if stream_res.status_code != 200:
+                        err = await stream_res.aread()
+                        raise HTTPException(
+                            status_code=stream_res.status_code,
+                            detail=f"Illinois Chat API error: {err.decode(errors='replace')[:500]}",
+                        )
+                    parts: List[str] = []
+                    async for line in stream_res.aiter_lines():
+                        if not line:
+                            continue
+                        raw = line[6:].strip() if line.startswith("data:") else line.strip()
+                        if not raw or raw == "[DONE]":
+                            continue
+                        try:
+                            chunk = json.loads(raw)
+                            piece = _extract_illinois_text(chunk)
+                            if piece:
+                                parts.append(piece)
+                        except json.JSONDecodeError:
+                            parts.append(raw)
+                    text = "".join(parts).strip()
+                    if not text and res.status_code != 200:
+                        raise HTTPException(
+                            status_code=res.status_code,
+                            detail=f"Illinois Chat API error: {(res.text or '')[:500]}",
+                        )
+
+            if not text:
+                raise HTTPException(status_code=502, detail="Illinois Chat returned empty content")
+
+            return {
+                "choices": [{"message": {"content": text}}],
+                "model": use_model,
+                "provider": "illinois_chat",
+            }
+    except HTTPException:
+        raise
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Illinois Chat request timeout")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Illinois Chat call failed: {str(e)}")
+
+
+async def call_llm(
+    messages: List[Dict[str, str]],
+    model: Optional[str] = None,
+    temperature: float = LLM_TEMPERATURE,
+    max_tokens: int = LLM_MAX_TOKENS,
+    force_json: bool = True,
+    api_key: Optional[str] = None,
+    provider: Optional[str] = None,
+) -> Dict:
+    """
+    Unified LLM call for reports.
+    provider: illinois_chat | openrouter (default from LLM_PROVIDER env).
+    """
+    prov = (provider or LLM_PROVIDER or "openrouter").strip().lower()
+    if prov in ("illinois_chat", "illinois", "uiuc_chat", "uiuc"):
+        return await call_illinois_chat(
+            messages=messages,
+            model=model or ILLINOIS_CHAT_MODEL,
+            temperature=temperature,
+            force_json=force_json,
+        )
+    return await call_openrouter(
+        messages=messages,
+        model=model or DEFAULT_MODEL,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        force_json=force_json,
+        api_key=api_key,
+    )
 
 
 def _parse_llm_json(content: str) -> Dict:
@@ -368,8 +562,12 @@ async def generate_weekly_report(
         annotations_by_date="\n".join([f"- {date}: {count} annotations" for date, count in project_data["annotations_by_date"].items()])
     )
     
-    # 4. 调用LLM
-    model = request.model or DEFAULT_MODEL
+    # 4. 调用LLM（OpenRouter 或 Illinois Chat，由 LLM_PROVIDER 决定）
+    if LLM_PROVIDER in ("illinois_chat", "illinois", "uiuc_chat", "uiuc"):
+        # API requires model on every call (UI chatbot selection is not inherited)
+        model = request.model or ILLINOIS_CHAT_MODEL
+    else:
+        model = request.model or DEFAULT_MODEL
     messages = [
         {
             "role": "system",
@@ -382,15 +580,16 @@ async def generate_weekly_report(
     ]
     
     try:
-        response = await call_openrouter(
+        response = await call_llm(
             messages=messages,
             model=model,
             temperature=0.5,
-            max_tokens=3000
+            max_tokens=3000,
+            force_json=True,
         )
         
         content = response["choices"][0]["message"]["content"]
-        report = json.loads(content)
+        report = _parse_llm_json(content)
         
         # 5. 返回固定格式
         return {
@@ -399,12 +598,15 @@ async def generate_weekly_report(
             "metadata": {
                 "generated_at": datetime.utcnow().isoformat(),
                 "model_used": model,
+                "provider": response.get("provider") or LLM_PROVIDER,
                 "cost": 0.002  # 简化版，实际应计算
             }
         }
         
     except json.JSONDecodeError:
         raise HTTPException(status_code=500, detail="Failed to parse LLM response as JSON")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate report: {str(e)}")
 
@@ -464,9 +666,6 @@ async def generate_weekly_summary(
         annotations_data = project_data.get("annotations", [])
         annotations_by_date = project_data.get("annotations_by_date", {})
         
-        # 使用 LLM 生成简洁总结
-        model = "anthropic/claude-3.5-haiku"
-        
         # 构建更详细的 prompt，包含 annotation 趋势
         daily_summary = "\n".join([f"  - {date}: {count} annotations" 
                                    for date, count in sorted(annotations_by_date.items())[:7]])
@@ -490,7 +689,11 @@ Please write a brief, professional summary suitable for a weekly report."""
             {"role": "user", "content": prompt}
         ]
         
-        response = await call_openrouter(messages, model=model)
+        if LLM_PROVIDER in ("illinois_chat", "illinois", "uiuc_chat", "uiuc"):
+            model = ILLINOIS_CHAT_MODEL
+        else:
+            model = DEFAULT_MODEL
+        response = await call_llm(messages, model=model, force_json=False)
         
         content = response["choices"][0]["message"]["content"].strip()
         
@@ -500,6 +703,7 @@ Please write a brief, professional summary suitable for a weekly report."""
             "generated_at": datetime.utcnow().isoformat(),
             "metadata": {
                 "model": model,
+                "provider": response.get("provider") or LLM_PROVIDER,
                 "period": f"{start_str} to {end_str}",
                 "stats": {
                     "annotations": total_annotations,
@@ -622,7 +826,10 @@ async def generate_monthly_report(
     )
     
     # 4. 调用LLM
-    model = request.model or DEFAULT_MODEL
+    if LLM_PROVIDER in ("illinois_chat", "illinois", "uiuc_chat", "uiuc"):
+        model = request.model or ILLINOIS_CHAT_MODEL
+    else:
+        model = request.model or DEFAULT_MODEL
     messages = [
         {
             "role": "system",
@@ -635,15 +842,16 @@ async def generate_monthly_report(
     ]
     
     try:
-        response = await call_openrouter(
+        response = await call_llm(
             messages=messages,
             model=model,
             temperature=0.5,
-            max_tokens=4000
+            max_tokens=4000,
+            force_json=True,
         )
         
         content = response["choices"][0]["message"]["content"]
-        report = json.loads(content)
+        report = _parse_llm_json(content)
         
         # 5. 返回固定格式
         return {
@@ -652,10 +860,13 @@ async def generate_monthly_report(
             "metadata": {
                 "generated_at": datetime.utcnow().isoformat(),
                 "model_used": model,
+                "provider": response.get("provider") or LLM_PROVIDER,
                 "cost": 0.003
             }
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate monthly report: {str(e)}")
 

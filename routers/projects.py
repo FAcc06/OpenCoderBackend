@@ -451,6 +451,30 @@ async def update_project_settings(
 
     await core_db.projects.update_one({"_id": project_oid}, {"$set": updates})
 
+    try:
+        from services.activity_log_service import log_user_activity
+        changed = []
+        if data.cluster_uri is not None:
+            changed.append("database")
+        if data.llm_enabled is not None:
+            changed.append("ai_enabled")
+        if data.openrouter_api_key is not None:
+            changed.append("api_key")
+        if data.llm_model is not None or data.annotation_model is not None:
+            changed.append("models")
+        await log_user_activity(
+            core_db,
+            user_oid,
+            "settings.updated",
+            "Updated project settings",
+            project_id=project_oid,
+            event_type="settings.updated",
+            payload={"changed": changed},
+            role="project-manager",
+        )
+    except Exception:
+        pass
+
     return {"success": True, "message": "Settings saved"}
 
 

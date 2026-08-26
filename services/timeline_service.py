@@ -1,8 +1,11 @@
 """
-Project Activity Timeline — project logs into TimelineEvents.
+Project Logbook — project activity_logs → feed events.
 
 Raw activity_logs are filtered, mapped to event types, and aggregated
 (e.g. many annotation.submit → one coding.activity per user per day).
+
+This is an event history (what happened), not an epistemology /
+research-decision journal (why a coding choice was made).
 """
 from __future__ import annotations
 
@@ -23,7 +26,7 @@ TIMELINE_EXCLUDE_ACTIONS = frozenset({
     "project.enter",
 })
 
-# Map atomic log actions → timeline event type + renderer
+# Map atomic log actions → logbook event type + renderer
 ACTION_MAP: Dict[str, Tuple[str, str]] = {
     "project.created": ("project.created", "project"),
     "member.applied": ("member.applied", "member"),
@@ -47,6 +50,11 @@ ACTION_MAP: Dict[str, Tuple[str, str]] = {
     "export.completed": ("export.completed", "export"),
     "transcription.completed": ("transcription.completed", "transcription"),
     "transcription.summarized": ("transcription.summarized", "transcription"),
+    "memo.added": ("memo.added", "memo"),
+    "note.added": ("memo.added", "memo"),
+    "settings.updated": ("settings.updated", "settings"),
+    "ai.report_generated": ("ai.report_generated", "ai"),
+    "discussion.recorded": ("discussion.recorded", "discussion"),
 }
 
 

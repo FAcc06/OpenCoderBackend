@@ -8,12 +8,12 @@ import os
 from datetime import datetime
 from dotenv import load_dotenv
 
+# Load .env before importing routers (module-level os.getenv reads)
+load_dotenv()
+
 from database import connect_to_mongo, close_mongo_connection
 from routers import users, projects, applications, tasks, assignments, annotations, tag_groups, board, public, dashboard, auth, llm, notifications, chat, test_drive, exports, consensus, proxy, pdf_coding, transcription, activity_logs
 from services.transcription_service import transcription_worker_loop
-
-# 加载环境变量
-load_dotenv()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

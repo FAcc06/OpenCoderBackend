@@ -85,6 +85,25 @@ async def upsert_task_note(
         }},
         upsert=True,
     )
+
+    if (body.content or "").strip():
+        try:
+            from services.activity_log_service import log_user_activity
+            core_db = get_core_db()
+            await log_user_activity(
+                core_db,
+                coder_id,
+                "memo.added",
+                "Added or updated a task memo",
+                project_id=project_oid,
+                event_type="memo.added",
+                resource_type="task",
+                resource_id=str(task_oid),
+                payload={"task_id": str(task_oid)},
+            )
+        except Exception:
+            pass
+
     return {"success": True, "updated_at": now.isoformat()}
 
 
