@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "coded_segment_revelation_threshold": 20,
+  "stance_labels": ["constructivist", "interpretivist", "post-positivist", "emerging"],
+  "dimensions": {
+    "inductiveReasoning": {
+      "description": "Codebook evolution / inductive revision of codes",
+      "weights": {
+        "codebook_change_rate": 0.35,
+        "rename_rate": 0.25,
+        "rename_with_reason_ratio": 0.2,
+        "option_definition_change_rate": 0.2
+      }
+    },
+    "codeStability": {
+      "description": "Stability of codes once introduced (inverse of churn)",
+      "weights": {
+        "inverse_codebook_churn": 0.5,
+        "inverse_rename_rate": 0.3,
+        "early_codebook_settled": 0.2
+      }
+    },
+    "contextSensitivity": {
+      "description": "Variable coding units / span diversity and disagreement engagement",
+      "weights": {
+        "span_length_variability": 0.4,
+        "unresolved_disagreement_share": 0.25,
+        "resolved_disagreement_share": 0.15,
+        "segment_vs_whole_mix": 0.2
+      }
+    },
+    "reflexiveAwareness": {
+      "description": "Documented reasons, memos, and reflection responses",
+      "weights": {
+        "change_note_coverage": 0.4,
+        "memo_activity": 0.35,
+        "researcher_reflection_recorded": 0.25
+      }
+    }
+  },
+  "stance_mapping": {
+    "constructivist": {
+      "inductiveReasoning": [55, 100],
+      "codeStability": [0, 45],
+      "contextSensitivity": [40, 100],
+      "reflexiveAwareness": [40, 100]
+    },
+    "interpretivist": {
+      "inductiveReasoning": [40, 100],
+      "codeStability": [0, 55],
+      "contextSensitivity": [55, 100],
+      "reflexiveAwareness": [35, 100]
+    },
+    "post-positivist": {
+      "inductiveReasoning": [0, 40],
+      "codeStability": [55, 100],
+      "contextSensitivity": [0, 45],
+      "reflexiveAwareness": [0, 50]
+    }
+  },
+  "evidence_templates": {
+    "high_rename": "Codes were renamed multiple times during analysis",
+    "rename_without_reason": "Several code renames lack a documented change note",
+    "rename_with_reason": "Codebook changes often include a written rationale",
+    "high_codebook_churn": "The codebook continued to evolve across the coding period",
+    "stable_codebook": "Codebook structure remained relatively stable after early coding",
+    "span_variable": "Coding span / selection length varies substantially",
+    "span_uniform": "Coding units tend toward similar selection lengths",
+    "unresolved_disagreements": "Several coder disagreements remain unresolved",
+    "resolved_disagreements": "Disagreements were discussed and resolved through consensus",
+    "memo_active": "Reflexive memos / task notes were written during coding",
+    "memo_sparse": "Few reflexive memos accompany coding decisions",
+    "emerging": "Behavioral signals are still forming; stance remains emerging"
+  }
+}

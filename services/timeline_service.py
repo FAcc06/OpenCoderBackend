@@ -55,6 +55,8 @@ ACTION_MAP: Dict[str, Tuple[str, str]] = {
     "settings.updated": ("settings.updated", "settings"),
     "ai.report_generated": ("ai.report_generated", "ai"),
     "discussion.recorded": ("discussion.recorded", "discussion"),
+    "epistemology.reflection_recorded": ("epistemology.reflection_recorded", "epistemology"),
+    "epistemology.reflection_response": ("epistemology.reflection_recorded", "epistemology"),
 }
 
 

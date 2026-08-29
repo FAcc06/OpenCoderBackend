@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from database import connect_to_mongo, close_mongo_connection
-from routers import users, projects, applications, tasks, assignments, annotations, tag_groups, board, public, dashboard, auth, llm, notifications, chat, test_drive, exports, consensus, proxy, pdf_coding, transcription, activity_logs
+from routers import users, projects, applications, tasks, assignments, annotations, tag_groups, board, public, dashboard, auth, llm, notifications, chat, test_drive, exports, consensus, proxy, pdf_coding, transcription, activity_logs, epistemology
 from services.transcription_service import transcription_worker_loop
 
 @asynccontextmanager
@@ -111,6 +111,7 @@ app.include_router(proxy.router, prefix="/api", tags=["proxy"])
 app.include_router(pdf_coding.router, prefix="/api/projects", tags=["pdf-coding"])
 app.include_router(transcription.router, prefix="/api/projects", tags=["transcription"])
 app.include_router(activity_logs.router, tags=["activity-logs"])
+app.include_router(epistemology.router)
 
 @app.get("/")
 async def root():

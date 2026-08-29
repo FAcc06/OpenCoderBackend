@@ -67,6 +67,16 @@ class AnnotationRequest(BaseModel):
     model: Optional[str] = None
 
 
+class SuggestCodebookRequest(BaseModel):
+    """LLM codebook suggestion — returns TagGroup-shaped JSON for the Code Book UI."""
+    project_id: str
+    user_prompt: Optional[str] = None
+    sample_size: int = 100
+    # replace = suggest a full codebook from samples; extend = add complementary groups
+    mode: str = "replace"
+    model: Optional[str] = None
+
+
 # ============== Helper Functions ==============
 
 def load_prompt_template(template_name: str) -> str:
@@ -386,6 +396,150 @@ def _format_tag_groups_for_prompt(tag_groups: List[Dict]) -> str:
                 lines.append(f"  - value=`{val}` | label={lab}")
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks) if blocks else "(no tag groups)"
+
+
+def _slug_id(text: str, fallback: str = "item") -> str:
+    import re
+
+    s = (text or "").strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "_", s).strip("_")
+    s = s[:48] or fallback
+    return s
+
+
+def _task_text_for_codebook(task: Dict, max_chars: int = 700) -> str:
+    """Extract a short text sample from a task for codebook induction."""
+    payload = task.get("payload") or {}
+    title = (task.get("title") or "").strip()
+    parts: List[str] = []
+    if title:
+        parts.append(title)
+
+    text = (payload.get("text") or "").strip()
+    if text:
+        parts.append(text)
+
+    meta = payload.get("meta") or payload.get("metadata") or {}
+    bib = meta.get("bibliographic") if isinstance(meta, dict) else None
+    if isinstance(bib, dict):
+        for key in ("title", "authors", "abstract", "year"):
+            v = bib.get(key)
+            if v:
+                parts.append(f"{key}: {v}")
+
+    # Media filenames as weak signal when no transcript text
+    for media_key in ("image", "video", "audio", "pdf"):
+        media = payload.get(media_key)
+        if isinstance(media, dict):
+            fn = (media.get("original_filename") or "").strip()
+            if fn:
+                parts.append(f"{media_key}: {fn}")
+
+    blob = " | ".join(p for p in parts if p).strip()
+    if not blob:
+        blob = f"(empty {task.get('task_type') or 'task'})"
+    if len(blob) > max_chars:
+        blob = blob[: max_chars - 1] + "…"
+    return blob
+
+
+def _normalize_suggested_tag_groups(raw: Any) -> List[Dict[str, Any]]:
+    """
+    Force LLM output into the TagGroupCreate shape the Code Book frontend expects.
+    Accepts {"tag_groups": [...]} or a bare list.
+    """
+    if isinstance(raw, dict):
+        groups_in = raw.get("tag_groups") or raw.get("groups") or raw.get("codebook") or []
+    elif isinstance(raw, list):
+        groups_in = raw
+    else:
+        groups_in = []
+
+    if not isinstance(groups_in, list):
+        raise ValueError("LLM response missing tag_groups array")
+
+    out: List[Dict[str, Any]] = []
+    seen_gids: set = set()
+
+    for i, g in enumerate(groups_in):
+        if not isinstance(g, dict):
+            continue
+        name = (g.get("name") or g.get("group_name") or f"Group {i + 1}").strip()
+        gid = (g.get("group_id") or g.get("id") or "").strip() or _slug_id(name, f"group_{i + 1}")
+        gid = _slug_id(gid, f"group_{i + 1}")
+        base = gid
+        n = 2
+        while gid in seen_gids:
+            gid = f"{base}_{n}"
+            n += 1
+        seen_gids.add(gid)
+
+        gtype = (g.get("type") or "single").strip().lower()
+        if gtype not in ("single", "multi"):
+            gtype = "single"
+
+        options_in = g.get("options") or g.get("tags") or g.get("labels") or []
+        options_out: List[Dict[str, Any]] = []
+        seen_oids: set = set()
+        if isinstance(options_in, list):
+            for j, opt in enumerate(options_in):
+                if isinstance(opt, str):
+                    label = opt.strip()
+                    oid = _slug_id(label, f"opt_{j + 1}")
+                    desc = ""
+                elif isinstance(opt, dict):
+                    label = (
+                        opt.get("label")
+                        or opt.get("name")
+                        or opt.get("value")
+                        or f"Option {j + 1}"
+                    )
+                    label = str(label).strip()
+                    oid = (
+                        opt.get("option_id")
+                        or opt.get("value")
+                        or opt.get("id")
+                        or _slug_id(label, f"opt_{j + 1}")
+                    )
+                    oid = _slug_id(str(oid), f"opt_{j + 1}")
+                    desc = (opt.get("description") or "").strip()
+                else:
+                    continue
+                base_o = oid
+                k = 2
+                while oid in seen_oids:
+                    oid = f"{base_o}_{k}"
+                    k += 1
+                seen_oids.add(oid)
+                options_out.append(
+                    {
+                        "option_id": oid,
+                        "label": label or oid,
+                        "order": j + 1,
+                        "active": True if not isinstance(opt, dict) else bool(opt.get("active", True)),
+                        "description": desc,
+                    }
+                )
+
+        if not options_out:
+            continue
+
+        out.append(
+            {
+                "group_id": gid,
+                "name": name,
+                "description": (g.get("description") or "").strip(),
+                "type": gtype,
+                "required": bool(g.get("required", False)),
+                "order": int(g.get("order") or (i + 1)),
+                "active": bool(g.get("active", True)),
+                "options": options_out,
+            }
+        )
+
+    if not out:
+        raise ValueError("LLM returned no usable tag_groups")
+    return out
 
 
 async def fetch_project_data(project_id: str, start_date: str, end_date: str) -> Dict:
@@ -1100,3 +1254,173 @@ async def annotate_sentence(
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to annotate: {str(e)}")
+
+
+@router.post("/api/llm/suggest-codebook")
+async def suggest_codebook(
+    request: SuggestCodebookRequest,
+    token: str = Query(...),
+):
+    """
+    Suggest a codebook from recent tasks + optional user prompt.
+
+    Response `tag_groups` is normalized to TagGroupCreate shape so the Code Book
+    UI can preview / edit / apply without further remapping:
+      group_id, name, description, type, required, order, active,
+      options[{ option_id, label, order, active, description }]
+    Does NOT write to the database.
+    """
+    try:
+        verify_token(token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    from bson import ObjectId
+
+    project_id = (request.project_id or "").strip()
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id is required")
+
+    try:
+        project_oid = ObjectId(project_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid project_id")
+
+    core_db = get_core_db()
+    project = await core_db.projects.find_one({"_id": project_oid})
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    llm_cfg = project.get("llm_settings") or {}
+    if llm_cfg.get("llm_enabled", True) is False:
+        raise HTTPException(
+            status_code=403,
+            detail="AI features are disabled for this project (Settings → AI).",
+        )
+
+    project_db = await get_project_db(project_id)
+    if project_db is None:
+        raise HTTPException(status_code=404, detail="Project database not found")
+
+    sample_size = max(1, min(int(request.sample_size or 100), 150))
+    cursor = (
+        project_db.tasks.find({})
+        .sort([("created_at", -1)])
+        .limit(sample_size)
+    )
+    tasks = await cursor.to_list(length=sample_size)
+
+    samples: List[str] = []
+    for idx, task in enumerate(tasks, start=1):
+        samples.append(f"{idx}. [{task.get('task_type') or 'text'}] {_task_text_for_codebook(task)}")
+
+    existing_docs = (
+        await project_db.tag_groups.find({}).sort([("order", 1)]).to_list(length=200)
+    )
+    existing_for_prompt = [
+        {
+            "group_id": g.get("group_id"),
+            "name": g.get("name"),
+            "description": g.get("description"),
+            "type": g.get("type"),
+            "options": [
+                {
+                    "option_id": o.get("option_id"),
+                    "label": o.get("label"),
+                    "description": o.get("description"),
+                }
+                for o in (g.get("options") or [])
+            ],
+        }
+        for g in existing_docs
+    ]
+
+    mode = (request.mode or "replace").strip().lower()
+    if mode not in ("replace", "extend"):
+        mode = "replace"
+
+    user_prompt = (request.user_prompt or "").strip() or "(none — infer from samples)"
+    project_context = (
+        f"Name: {project.get('name') or project_id}\n"
+        f"Memo: {(project.get('memo') or project.get('description') or '').strip() or '(none)'}"
+    )
+
+    template = load_prompt_template("suggest_codebook")
+    prompt = (
+        template.replace("{project_context}", project_context)
+        .replace(
+            "{existing_codebook}",
+            _format_tag_groups_for_prompt(existing_for_prompt)
+            if existing_for_prompt
+            else "(empty — no tag groups yet)",
+        )
+        .replace(
+            "{mode}",
+            "extend — propose complementary groups, avoid duplicating existing ones"
+            if mode == "extend"
+            else "replace — propose a full codebook suitable for these materials",
+        )
+        .replace("{user_prompt}", user_prompt)
+        .replace("{sample_count}", str(len(samples)))
+        .replace(
+            "{task_samples}",
+            "\n".join(samples) if samples else "(no tasks uploaded yet — rely on user prompt)",
+        )
+    )
+
+    if LLM_PROVIDER in ("illinois_chat", "illinois", "uiuc_chat", "uiuc"):
+        model = request.model or ILLINOIS_CHAT_MODEL
+    else:
+        model = request.model or DEFAULT_MODEL
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You design qualitative coding codebooks. "
+                "Reply with JSON only. The top-level key MUST be tag_groups, "
+                "and each group MUST match the OpenCoder TagGroup schema."
+            ),
+        },
+        {"role": "user", "content": prompt},
+    ]
+
+    try:
+        response = await call_llm(
+            messages=messages,
+            model=model,
+            temperature=0.4,
+            max_tokens=max(LLM_MAX_TOKENS, 4000),
+            force_json=True,
+        )
+        content = response["choices"][0]["message"]["content"]
+        parsed = _parse_llm_json(content)
+        tag_groups = _normalize_suggested_tag_groups(parsed)
+        rationale = ""
+        if isinstance(parsed, dict):
+            rationale = (parsed.get("rationale") or parsed.get("reasoning") or "").strip()
+
+        return {
+            "success": True,
+            "tag_groups": tag_groups,
+            "rationale": rationale,
+            "metadata": {
+                "generated_at": datetime.utcnow().isoformat(),
+                "model_used": model,
+                "provider": response.get("provider") or LLM_PROVIDER,
+                "sampled_tasks": len(samples),
+                "mode": mode,
+            },
+        }
+    except HTTPException:
+        raise
+    except (json.JSONDecodeError, ValueError) as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Model returned invalid codebook JSON: {str(e)}",
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to suggest codebook: {str(e)}",
+        )
